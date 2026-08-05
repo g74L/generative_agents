@@ -101,4 +101,5 @@ ENV/
 # Rope project settings
 .ropeproject
 .venv/
+.venv-modern-contract/
 
