@@ -84,7 +84,10 @@ class LLMProvider(Protocol):
   provider_kind: str
   transport_kind: str
 
-  def chat_completion(self, *, model: str, messages: List[Dict[str, str]]) -> Any:
+  def chat_completion(self, *, model: str, messages: List[Dict[str, str]],
+                      temperature: Optional[float] = None,
+                      max_tokens: Optional[int] = None, stop: Any = None,
+                      response_format: Any = None) -> Any:
     ...
 
   def text_completion(self, *, model: str, prompt: str, temperature: float,
@@ -104,8 +107,15 @@ class OpenAILegacyProvider:
   provider_kind = LEGACY_OPENAI
   transport_kind = LEGACY_TRANSPORT
 
-  def chat_completion(self, *, model, messages):
-    return openai.ChatCompletion.create(model=model, messages=messages)
+  def chat_completion(self, *, model, messages, temperature=None,
+                      max_tokens=None, stop=None, response_format=None):
+    arguments = {"model": model, "messages": messages}
+    for name, value in (
+        ("temperature", temperature), ("max_tokens", max_tokens),
+        ("stop", stop), ("response_format", response_format)):
+      if value is not None:
+        arguments[name] = value
+    return openai.ChatCompletion.create(**arguments)
 
   def text_completion(self, *, model, prompt, temperature, max_tokens, top_p,
                       frequency_penalty, presence_penalty, stream, stop):
@@ -177,6 +187,16 @@ class _LogicalCallState:
 
 _logical_call_state: ContextVar[Optional[_LogicalCallState]] = ContextVar(
   "legacy_llm_logical_call", default=None)
+_chat_provider_override: ContextVar[Optional[LLMProvider]] = ContextVar(
+  "chat_provider_override", default=None)
+_completion_provider_override: ContextVar[Optional[LLMProvider]] = ContextVar(
+  "completion_provider_override", default=None)
+_embedding_provider_override: ContextVar[Optional[LLMProvider]] = ContextVar(
+  "embedding_provider_override", default=None)
+_provider_operation_scope = ContextVar(
+  "provider_operation_scope", default=None)
+_provider_operation_fallback = ContextVar(
+  "provider_operation_fallback", default=None)
 _embedding_call_category: ContextVar[str] = ContextVar(
   "embedding_call_category", default=UNSPECIFIED)
 _logical_call_ids = itertools.count(1)
@@ -211,6 +231,29 @@ def get_provider() -> LLMProvider:
   return _provider
 
 
+def get_chat_provider() -> LLMProvider:
+  """Return the Chat-only override, or the unchanged general provider."""
+  provider = _chat_provider_override.get()
+  return provider if provider is not None else _general_provider_for(CHAT)
+
+
+def get_completion_provider() -> LLMProvider:
+  provider = _completion_provider_override.get()
+  return provider if provider is not None else _general_provider_for(COMPLETION)
+
+
+def get_embedding_provider() -> LLMProvider:
+  provider = _embedding_provider_override.get()
+  return provider if provider is not None else _general_provider_for(EMBEDDING)
+
+
+def _general_provider_for(operation):
+  operations = _provider_operation_scope.get()
+  if operations is None or operation in operations:
+    return _provider
+  return _provider_operation_fallback.get() or _default_provider
+
+
 def set_provider(provider: LLMProvider) -> LLMProvider:
   """Install a provider and return the previously active provider."""
   global _provider
@@ -225,12 +268,51 @@ def reset_provider() -> None:
 
 
 @contextmanager
-def use_provider(provider: LLMProvider) -> Iterator[LLMProvider]:
+def use_provider(provider: LLMProvider, operations=None) -> Iterator[LLMProvider]:
   previous = set_provider(provider)
+  selected_operations = ((CHAT, COMPLETION, EMBEDDING)
+                         if operations is None else tuple(operations))
+  if any(item not in (CHAT, COMPLETION, EMBEDDING)
+         for item in selected_operations):
+    set_provider(previous)
+    raise ValueError("provider operation scope contains an unknown operation")
+  operation_token = _provider_operation_scope.set(
+    frozenset(selected_operations))
+  fallback_token = _provider_operation_fallback.set(previous)
   try:
     yield provider
   finally:
+    _provider_operation_fallback.reset(fallback_token)
+    _provider_operation_scope.reset(operation_token)
     set_provider(previous)
+
+
+@contextmanager
+def use_chat_provider(provider: LLMProvider) -> Iterator[LLMProvider]:
+  """Override Chat only; Completion and Embedding keep the general provider."""
+  token = _chat_provider_override.set(provider)
+  try:
+    yield provider
+  finally:
+    _chat_provider_override.reset(token)
+
+
+@contextmanager
+def use_completion_provider(provider: LLMProvider) -> Iterator[LLMProvider]:
+  token = _completion_provider_override.set(provider)
+  try:
+    yield provider
+  finally:
+    _completion_provider_override.reset(token)
+
+
+@contextmanager
+def use_embedding_provider(provider: LLMProvider) -> Iterator[LLMProvider]:
+  token = _embedding_provider_override.set(provider)
+  try:
+    yield provider
+  finally:
+    _embedding_provider_override.reset(token)
 
 
 @contextmanager
@@ -418,10 +500,15 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any],
   started = time.perf_counter()
   fingerprint = _fingerprint(kwargs)
   model_or_engine = str(kwargs.get("model", ""))
-  provider_kind = getattr(_provider, "provider_kind", None)
-  transport_kind = getattr(_provider, "transport_kind", None)
+  active_provider = {
+    CHAT: get_chat_provider,
+    COMPLETION: get_completion_provider,
+    EMBEDDING: get_embedding_provider,
+  }[operation]()
+  provider_kind = getattr(active_provider, "provider_kind", None)
+  transport_kind = getattr(active_provider, "transport_kind", None)
   try:
-    result = getattr(_provider, method_name)(**kwargs)
+    result = getattr(active_provider, method_name)(**kwargs)
     if result_validator is not None:
       try:
         result_validator(result)
@@ -430,6 +517,10 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any],
           on_result_validation_error()
         raise
   except Exception as error:
+    error_request_id = getattr(error, "request_id", None)
+    if (not isinstance(error_request_id, str)
+        or not error_request_id.strip() or len(error_request_id) > 512):
+      error_request_id = None
     _telemetry.append(TelemetryEvent(
       operation=operation,
       logical_call_id=state.call_id,
@@ -441,11 +532,12 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any],
       error_type=type(error).__name__,
       provider_kind=provider_kind,
       transport_kind=transport_kind,
+      request_id=error_request_id,
     ))
     raise
 
   metadata = None
-  consume_metadata = getattr(_provider, "consume_response_metadata", None)
+  consume_metadata = getattr(active_provider, "consume_response_metadata", None)
   if callable(consume_metadata):
     metadata = consume_metadata()
   _telemetry.append(TelemetryEvent(
@@ -470,11 +562,21 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any],
   return result
 
 
-def chat_completion(*, model: str, messages: List[Dict[str, str]]) -> Any:
-  return _invoke(CHAT, "chat_completion", {
-    "model": model,
-    "messages": messages,
-  })
+def chat_completion(*, model: str, messages: List[Dict[str, str]],
+                    temperature: Optional[float] = None,
+                    max_tokens: Optional[int] = None, stop: Any = None,
+                    response_format: Any = None, result_validator=None,
+                    on_result_validation_error=None) -> Any:
+  arguments = {"model": model, "messages": messages}
+  for name, value in (
+      ("temperature", temperature), ("max_tokens", max_tokens),
+      ("stop", stop), ("response_format", response_format)):
+    if value is not None:
+      arguments[name] = value
+  return _invoke(
+    CHAT, "chat_completion", arguments,
+    result_validator=result_validator,
+    on_result_validation_error=on_result_validation_error)
 
 
 def text_completion(*, model: str, prompt: str, temperature: float,
@@ -551,7 +653,8 @@ def _cache_key(provider_identity: str, model: str,
 
 def embedding(*, input: List[str], model: str) -> Any:
   runtime_manifest = get_runtime_embedding_manifest()
-  logical_provider = getattr(_provider, "embedding_space_provider", None)
+  active_provider = get_embedding_provider()
+  logical_provider = getattr(active_provider, "embedding_space_provider", None)
   if logical_provider is not None:
     assert_runtime_embedding_request(
       logical_provider, model, runtime_manifest.normalization_version,
@@ -567,7 +670,7 @@ def embedding(*, input: List[str], model: str) -> Any:
         _embedding_cache_stats["cache_misses"] += 1
         _embedding_category_stats[category]["cache_misses"] += 1
       _embedding_logical_events.append(EmbeddingLogicalEvent(
-        logical_call_id, model, _provider_identity(_provider), category, BYPASS,
+        logical_call_id, model, _provider_identity(active_provider), category, BYPASS,
         _fingerprint({"input_count": len(input), "model": model})))
       return _invoke(EMBEDDING, "embedding", {
         "input": input,
@@ -575,7 +678,7 @@ def embedding(*, input: List[str], model: str) -> Any:
       })
 
     normalized_text = _normalize_embedding_text(input[0])
-    provider_identity = _provider_identity(_provider)
+    provider_identity = _provider_identity(active_provider)
     key = _cache_key(
       provider_identity, model, runtime_manifest.embedding_space_version,
       runtime_manifest.normalization_version, normalized_text)
@@ -622,7 +725,7 @@ def embedding(*, input: List[str], model: str) -> Any:
       _validate_runtime_embedding_vector(vector, runtime_manifest)
 
     def discard_invalid_response_metadata():
-      consume_metadata = getattr(_provider, "consume_response_metadata", None)
+      consume_metadata = getattr(active_provider, "consume_response_metadata", None)
       if callable(consume_metadata):
         consume_metadata()
 
@@ -698,9 +801,15 @@ class FakeProvider:
       raise result
     return result
 
-  def chat_completion(self, *, model, messages):
-    return self._next(CHAT, self._chat_results, {
-      "model": model, "messages": messages})
+  def chat_completion(self, *, model, messages, temperature=None,
+                      max_tokens=None, stop=None, response_format=None):
+    arguments = {"model": model, "messages": messages}
+    for name, value in (
+        ("temperature", temperature), ("max_tokens", max_tokens),
+        ("stop", stop), ("response_format", response_format)):
+      if value is not None:
+        arguments[name] = value
+    return self._next(CHAT, self._chat_results, arguments)
 
   def text_completion(self, *, model, prompt, temperature, max_tokens, top_p,
                       frequency_penalty, presence_penalty, stream, stop):
@@ -744,5 +853,10 @@ def use_configured_provider(config, modern_client_adapter=None):
   """Scope transport configuration and its provider to the current context."""
   provider = create_llm_provider(config, modern_client_adapter)
   with use_llm_provider_config(config):
-    with use_provider(provider):
-      yield provider
+    if config.provider_kind == MODERN_OPENAI:
+      with use_provider(provider, operations=()):
+        with use_embedding_provider(provider):
+          yield provider
+    else:
+      with use_provider(provider):
+        yield provider

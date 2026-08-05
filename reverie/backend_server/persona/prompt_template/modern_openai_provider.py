@@ -19,7 +19,11 @@ from persona.prompt_template.llm_provider_config import (
 
 
 class LLMProviderError(RuntimeError):
-  pass
+  def __init__(self, message, request_id=None, provider_status=None):
+    super().__init__(message)
+    self.request_id = _safe_request_id(request_id)
+    self.provider_status = (provider_status
+                            if type(provider_status) is int else None)
 
 
 class ModernOpenAISdkUnavailableError(LLMProviderError):
@@ -78,6 +82,11 @@ class LLMMalformedResponseError(LLMProviderError):
   pass
 
 
+class ModernChatResponseValidationError(
+    LLMMalformedResponseError, LLMEmptyOutputError):
+  pass
+
+
 class LLMUnsupportedOperationError(LLMProviderError):
   pass
 
@@ -92,6 +101,12 @@ class NormalizedUsage:
   output_tokens: Optional[int] = None
   cached_input_tokens: Optional[int] = None
   reasoning_tokens: Optional[int] = None
+
+  @property
+  def total_tokens(self):
+    if self.input_tokens is None or self.output_tokens is None:
+      return None
+    return self.input_tokens + self.output_tokens
 
 
 @dataclass(frozen=True)
@@ -130,6 +145,23 @@ def _field(value, name, default=None):
   return getattr(value, name, default)
 
 
+def _safe_request_id(value):
+  if (isinstance(value, str) and value.strip()
+      and len(value) <= 512):
+    return value
+  return None
+
+
+def _validated_optional_text(value, field_name, max_length=512):
+  if value is None:
+    return None
+  if (not isinstance(value, str) or not value.strip()
+      or len(value) > max_length):
+    raise ModernChatResponseValidationError(
+      f"Modern Chat response has invalid {field_name}")
+  return value
+
+
 def _error_code(error):
   code = getattr(error, "code", None)
   if code:
@@ -144,26 +176,33 @@ def map_modern_sdk_error(error):
   name = type(error).__name__
   status = getattr(error, "status_code", None)
   code = _error_code(error)
+  request_id = _safe_request_id(getattr(error, "request_id", None))
+
+  def mapped(error_type, message):
+    return error_type(
+      message, request_id=request_id, provider_status=status)
+
   if name == "AuthenticationError" or status == 401:
-    return LLMAuthenticationError("Modern OpenAI authentication failed")
+    return mapped(LLMAuthenticationError, "Modern OpenAI authentication failed")
   if name == "PermissionDeniedError" or status == 403:
-    return LLMAuthorizationError("Modern OpenAI authorization failed")
+    return mapped(LLMAuthorizationError, "Modern OpenAI authorization failed")
   if name == "NotFoundError" or status == 404:
-    return LLMModelNotFoundError("Modern OpenAI model or resource not found")
+    return mapped(
+      LLMModelNotFoundError, "Modern OpenAI model or resource not found")
   if code in ("unsupported_parameter", "unsupported_value"):
-    return LLMUnsupportedParameterError(
+    return mapped(LLMUnsupportedParameterError,
       "Modern OpenAI request contains an unsupported parameter")
   if name in ("BadRequestError", "UnprocessableEntityError") or status in (400, 422):
-    return LLMInvalidRequestError("Modern OpenAI request is invalid")
+    return mapped(LLMInvalidRequestError, "Modern OpenAI request is invalid")
   if name in ("APITimeoutError", "TimeoutError"):
-    return LLMTimeoutError("Modern OpenAI request timed out")
+    return mapped(LLMTimeoutError, "Modern OpenAI request timed out")
   if name in ("APIConnectionError", "ConnectionError"):
-    return LLMConnectionError("Modern OpenAI connection failed")
+    return mapped(LLMConnectionError, "Modern OpenAI connection failed")
   if name == "RateLimitError" or status == 429:
-    return LLMRateLimitError("Modern OpenAI rate limit reached")
+    return mapped(LLMRateLimitError, "Modern OpenAI rate limit reached")
   if name == "InternalServerError" or (isinstance(status, int) and status >= 500):
-    return LLMServerError("Modern OpenAI server error")
-  return LLMProviderError("Modern OpenAI request failed")
+    return mapped(LLMServerError, "Modern OpenAI server error")
+  return mapped(LLMProviderError, "Modern OpenAI request failed")
 
 
 def _usage_from_response(response):
@@ -214,7 +253,11 @@ def _usage_from_response(response):
   completion_tokens = token_count(member(usage, "completion_tokens"))
   input_tokens = token_count(member(usage, "input_tokens"))
   output_tokens = token_count(member(usage, "output_tokens"))
-  token_count(member(usage, "total_tokens"))
+  total_tokens = token_count(member(usage, "total_tokens"))
+  if (total_tokens is not None and prompt_tokens is not None
+      and completion_tokens is not None
+      and total_tokens != prompt_tokens + completion_tokens):
+    raise LLMMalformedResponseError(malformed_message)
   prompt_details = member(usage, "prompt_tokens_details")
   completion_details = member(usage, "completion_tokens_details")
   return NormalizedUsage(
@@ -237,26 +280,74 @@ def normalize_chat_response(response):
   refusal = _field(message, "refusal")
   if refusal:
     raise LLMRefusalError("Modern chat response was refused")
-  status = _field(response, "status")
-  finish_reason = _field(choice, "finish_reason")
+  status = _validated_optional_text(
+    _field(response, "status"), "response status", 128)
+  finish_reason = _validated_optional_text(
+    _field(choice, "finish_reason"), "finish reason", 128)
   if status == "incomplete" or finish_reason in ("length", "content_filter"):
     raise LLMIncompleteResponseError("Modern chat response is incomplete")
   text = _field(message, "content")
   if text is None:
-    raise LLMEmptyOutputError("Modern chat response contains no output text")
+    raise ModernChatResponseValidationError(
+      "Modern Chat response contains no output text")
   if not isinstance(text, str):
-    raise LLMMalformedResponseError("Modern chat output text is malformed")
+    raise ModernChatResponseValidationError(
+      "Modern Chat response contains invalid output text")
   if not text.strip():
-    raise LLMEmptyOutputError("Modern chat response contains empty output")
-  return NormalizedTextResponse(
+    raise ModernChatResponseValidationError(
+      "Modern Chat response contains empty output text")
+  normalized = NormalizedTextResponse(
     text=text,
-    model=_field(response, "model"),
-    request_id=(_field(response, "_request_id")
-                or _field(response, "request_id")),
+    model=_validated_optional_text(
+      _field(response, "model"), "response model", 256),
+    request_id=_validated_optional_text(
+      (_field(response, "_request_id")
+       if _field(response, "_request_id") is not None
+       else _field(response, "request_id")), "request ID"),
     finish_reason=finish_reason,
     status=status or "completed",
     usage=_usage_from_response(response),
   )
+  return validate_normalized_text_response(normalized)
+
+
+def _validated_token(value, field_name):
+  if value is not None and (type(value) is not int or value < 0):
+    raise ModernChatResponseValidationError(
+      f"Modern Chat response has invalid {field_name}")
+  return value
+
+
+def validate_normalized_usage(usage):
+  if not isinstance(usage, NormalizedUsage):
+    raise ModernChatResponseValidationError(
+      "Modern Chat response has invalid usage metadata")
+  for field_name in (
+      "input_tokens", "output_tokens", "cached_input_tokens",
+      "reasoning_tokens"):
+    _validated_token(getattr(usage, field_name), field_name)
+  if (usage.cached_input_tokens is not None
+      and usage.input_tokens is not None
+      and usage.cached_input_tokens > usage.input_tokens):
+    raise ModernChatResponseValidationError(
+      "Modern Chat response has incoherent usage metadata")
+  _validated_token(usage.total_tokens, "total_tokens")
+  return usage
+
+
+def validate_normalized_text_response(response):
+  if not isinstance(response, NormalizedTextResponse):
+    raise ModernChatResponseValidationError(
+      "Modern Chat adapter returned an invalid response")
+  if not isinstance(response.text, str) or not response.text.strip():
+    raise ModernChatResponseValidationError(
+      "Modern Chat response contains empty or invalid output text")
+  _validated_optional_text(response.model, "response model", 256)
+  _validated_optional_text(response.request_id, "request ID")
+  _validated_optional_text(response.finish_reason, "finish reason", 128)
+  _validated_optional_text(response.status, "response status", 128)
+  validate_normalized_usage(response.usage)
+  return response
 
 
 def normalize_embedding_response(response):
@@ -303,13 +394,20 @@ class ModernOpenAIClientAdapter:
     factory = client_factory or _create_modern_sdk_client
     self.client = client if client is not None else factory(self.config)
 
-  def create_chat(self, *, model, messages):
+  def create_chat(self, *, model, messages, temperature=None,
+                  max_tokens=None, stop=None, response_format=None):
+    arguments = {
+      "model": model,
+      "messages": messages,
+      "store": self.config.store_responses,
+    }
+    for name, value in (
+        ("temperature", temperature), ("max_tokens", max_tokens),
+        ("stop", stop), ("response_format", response_format)):
+      if value is not None:
+        arguments[name] = value
     try:
-      response = self.client.chat.completions.create(
-        model=model,
-        messages=messages,
-        store=self.config.store_responses,
-      )
+      response = self.client.chat.completions.create(**arguments)
     except LLMProviderError:
       raise
     except Exception as error:
@@ -343,7 +441,7 @@ class ModernOpenAIProvider:
 
   def _remember(self, response):
     usage = response.usage
-    self._metadata.set(ProviderResponseMetadata(
+    metadata = ProviderResponseMetadata(
       request_id=response.request_id,
       response_model=response.model,
       finish_reason=getattr(response, "finish_reason", None),
@@ -352,22 +450,29 @@ class ModernOpenAIProvider:
       output_tokens=usage.output_tokens,
       cached_input_tokens=usage.cached_input_tokens,
       reasoning_tokens=usage.reasoning_tokens,
-    ))
+    )
+    self._metadata.set(metadata)
+    return metadata
 
   def consume_response_metadata(self):
     metadata = self._metadata.get()
     self._metadata.set(None)
     return metadata
 
-  def chat_completion(self, *, model, messages):
-    response = self.client_adapter.create_chat(model=model, messages=messages)
-    self._remember(response)
+  def chat_completion(self, *, model, messages, temperature=None,
+                      max_tokens=None, stop=None, response_format=None):
+    response = validate_normalized_text_response(
+      self.client_adapter.create_chat(
+      model=model, messages=messages, temperature=temperature,
+      max_tokens=max_tokens, stop=stop, response_format=response_format))
+    metadata = self._remember(response)
     return {
       "choices": [{
         "message": {"content": response.text},
         "finish_reason": response.finish_reason,
       }],
       "model": response.model,
+      "_normalized_metadata": metadata,
     }
 
   def embedding(self, *, input, model):
