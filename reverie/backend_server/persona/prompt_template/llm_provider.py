@@ -24,6 +24,16 @@ from persona.memory_structures.embedding_space import (
   assert_runtime_embedding_request,
   get_runtime_embedding_manifest,
 )
+from persona.prompt_template.llm_provider_config import (
+  FAKE,
+  FAKE_TRANSPORT,
+  LEGACY_OPENAI,
+  LEGACY_TRANSPORT,
+  MODERN_OPENAI,
+  LLMProviderConfig,
+  get_llm_provider_config,
+  use_llm_provider_config,
+)
 
 
 CHAT = "CHAT"
@@ -69,6 +79,8 @@ class LLMProvider(Protocol):
 
   provider_identity: str
   embedding_space_provider: Optional[str]
+  provider_kind: str
+  transport_kind: str
 
   def chat_completion(self, *, model: str, messages: List[Dict[str, str]]) -> Any:
     ...
@@ -87,6 +99,8 @@ class OpenAILegacyProvider:
 
   provider_identity = "openai-legacy"
   embedding_space_provider = "openai"
+  provider_kind = LEGACY_OPENAI
+  transport_kind = LEGACY_TRANSPORT
 
   def chat_completion(self, *, model, messages):
     return openai.ChatCompletion.create(model=model, messages=messages)
@@ -119,6 +133,16 @@ class TelemetryEvent:
   elapsed_seconds: float
   input_fingerprint: str
   error_type: Optional[str] = None
+  provider_kind: Optional[str] = None
+  transport_kind: Optional[str] = None
+  request_id: Optional[str] = None
+  response_model: Optional[str] = None
+  finish_reason: Optional[str] = None
+  response_status: Optional[str] = None
+  input_tokens: Optional[int] = None
+  output_tokens: Optional[int] = None
+  cached_input_tokens: Optional[int] = None
+  reasoning_tokens: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -388,17 +412,48 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any]) -> Any:
   started = time.perf_counter()
   fingerprint = _fingerprint(kwargs)
   model_or_engine = str(kwargs.get("model", ""))
+  provider_kind = getattr(_provider, "provider_kind", None)
+  transport_kind = getattr(_provider, "transport_kind", None)
   try:
     result = getattr(_provider, method_name)(**kwargs)
   except Exception as error:
     _telemetry.append(TelemetryEvent(
-      operation, state.call_id, attempt, model_or_engine, ERROR,
-      time.perf_counter() - started, fingerprint, type(error).__name__))
+      operation=operation,
+      logical_call_id=state.call_id,
+      physical_attempt=attempt,
+      model_or_engine=model_or_engine,
+      outcome=ERROR,
+      elapsed_seconds=time.perf_counter() - started,
+      input_fingerprint=fingerprint,
+      error_type=type(error).__name__,
+      provider_kind=provider_kind,
+      transport_kind=transport_kind,
+    ))
     raise
 
+  metadata = None
+  consume_metadata = getattr(_provider, "consume_response_metadata", None)
+  if callable(consume_metadata):
+    metadata = consume_metadata()
   _telemetry.append(TelemetryEvent(
-    operation, state.call_id, attempt, model_or_engine, SUCCESS,
-    time.perf_counter() - started, fingerprint))
+    operation=operation,
+    logical_call_id=state.call_id,
+    physical_attempt=attempt,
+    model_or_engine=model_or_engine,
+    outcome=SUCCESS,
+    elapsed_seconds=time.perf_counter() - started,
+    input_fingerprint=fingerprint,
+    provider_kind=provider_kind,
+    transport_kind=transport_kind,
+    request_id=getattr(metadata, "request_id", None),
+    response_model=getattr(metadata, "response_model", None),
+    finish_reason=getattr(metadata, "finish_reason", None),
+    response_status=getattr(metadata, "response_status", None),
+    input_tokens=getattr(metadata, "input_tokens", None),
+    output_tokens=getattr(metadata, "output_tokens", None),
+    cached_input_tokens=getattr(metadata, "cached_input_tokens", None),
+    reasoning_tokens=getattr(metadata, "reasoning_tokens", None),
+  ))
   return result
 
 
@@ -556,6 +611,8 @@ class FakeProvider:
     self.provider_identity = (provider_identity
                               or f"fake-{next(self._identity_counter)}")
     self.embedding_space_provider = embedding_space_provider
+    self.provider_kind = FAKE
+    self.transport_kind = FAKE_TRANSPORT
     self.calls: List[FakeCall] = []
     self._chat_results: Deque[Any] = deque()
     self._completion_results: Deque[Any] = deque()
@@ -609,3 +666,30 @@ class FakeProvider:
   def embedding(self, *, input, model):
     return self._next(EMBEDDING, self._embedding_results, {
       "input": input, "model": model})
+
+
+def create_llm_provider(config=None, modern_client_adapter=None):
+  """Create the explicitly selected provider; never fall back silently."""
+  selected = config or get_llm_provider_config()
+  if not isinstance(selected, LLMProviderConfig):
+    raise TypeError("LLM provider config must be LLMProviderConfig")
+  if selected.provider_kind == LEGACY_OPENAI:
+    return OpenAILegacyProvider()
+  if selected.provider_kind == FAKE:
+    return FakeProvider(provider_identity="configured-fake")
+  if selected.provider_kind == MODERN_OPENAI:
+    from persona.prompt_template.modern_openai_provider import (
+      ModernOpenAIProvider,
+    )
+    return ModernOpenAIProvider(
+      config=selected, client_adapter=modern_client_adapter)
+  raise ValueError(f"Unsupported provider_kind: {selected.provider_kind}")
+
+
+@contextmanager
+def use_configured_provider(config, modern_client_adapter=None):
+  """Scope transport configuration and its provider to the current context."""
+  provider = create_llm_provider(config, modern_client_adapter)
+  with use_llm_provider_config(config):
+    with use_provider(provider):
+      yield provider
