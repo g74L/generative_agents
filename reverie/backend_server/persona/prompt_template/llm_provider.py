@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import hashlib
 import itertools
 import json
+import math
 from numbers import Real
 from threading import RLock
 import time
@@ -20,6 +21,7 @@ from typing import Any, Deque, Dict, Iterator, List, Optional, Protocol, Tuple
 import openai
 
 from persona.memory_structures.embedding_space import (
+  EmbeddingVectorValidationError,
   LEGACY_ADA_002_MANIFEST,
   assert_runtime_embedding_request,
   get_runtime_embedding_manifest,
@@ -396,11 +398,15 @@ def _fingerprint(kwargs: Dict[str, Any]) -> str:
   return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
-def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any]) -> Any:
+def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any],
+            result_validator=None, on_result_validation_error=None) -> Any:
   state = _logical_call_state.get()
   if state is None:
     with logical_call():
-      return _invoke(operation, method_name, kwargs)
+      return _invoke(
+        operation, method_name, kwargs,
+        result_validator=result_validator,
+        on_result_validation_error=on_result_validation_error)
 
   state.physical_attempts += 1
   if operation == EMBEDDING:
@@ -416,6 +422,13 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any]) -> Any:
   transport_kind = getattr(_provider, "transport_kind", None)
   try:
     result = getattr(_provider, method_name)(**kwargs)
+    if result_validator is not None:
+      try:
+        result_validator(result)
+      except Exception:
+        if on_result_validation_error is not None:
+          on_result_validation_error()
+        raise
   except Exception as error:
     _telemetry.append(TelemetryEvent(
       operation=operation,
@@ -503,12 +516,34 @@ def _valid_embedding_vector(vector: Any) -> bool:
                   for value in vector))
 
 
-def _cache_key(provider_identity: str, model: str, normalization_version: str,
+def _validate_runtime_embedding_vector(vector, runtime_manifest):
+  """Validate non-legacy vectors against their complete local manifest."""
+  if not isinstance(vector, list):
+    raise EmbeddingVectorValidationError(
+      "runtime embedding response expected a vector list")
+  if len(vector) != runtime_manifest.dimensions:
+    raise EmbeddingVectorValidationError(
+      "runtime embedding response has incompatible dimensions")
+  squared_norm = 0.0
+  for value in vector:
+    if (not isinstance(value, Real) or isinstance(value, bool)
+        or not math.isfinite(value)):
+      raise EmbeddingVectorValidationError(
+        "runtime embedding response contains a non-finite numeric value")
+    squared_norm += float(value) * float(value)
+  if squared_norm == 0.0:
+    raise EmbeddingVectorValidationError(
+      "runtime embedding response has zero norm")
+
+
+def _cache_key(provider_identity: str, model: str,
+               embedding_space_version: str, normalization_version: str,
                normalized_text: str):
   return (
     provider_identity,
     model,
     EMBEDDING_VERSION,
+    embedding_space_version,
     normalization_version,
     normalized_text,
   )
@@ -542,12 +577,13 @@ def embedding(*, input: List[str], model: str) -> Any:
     normalized_text = _normalize_embedding_text(input[0])
     provider_identity = _provider_identity(_provider)
     key = _cache_key(
-      provider_identity, model, runtime_manifest.normalization_version,
-      normalized_text)
+      provider_identity, model, runtime_manifest.embedding_space_version,
+      runtime_manifest.normalization_version, normalized_text)
     key_fingerprint = _fingerprint({
       "provider_identity": provider_identity,
       "model": model,
       "embedding_version": EMBEDDING_VERSION,
+      "embedding_space_version": runtime_manifest.embedding_space_version,
       "normalization_version": runtime_manifest.normalization_version,
       "normalized_text": normalized_text,
     })
@@ -575,10 +611,27 @@ def embedding(*, input: List[str], model: str) -> Any:
     _embedding_logical_events.append(EmbeddingLogicalEvent(
       logical_call_id, model, provider_identity, category, cache_outcome,
       key_fingerprint))
+    strict_runtime = runtime_manifest != LEGACY_ADA_002_MANIFEST
+
+    def validate_response(response):
+      try:
+        vector = response["data"][0]["embedding"]
+      except (KeyError, IndexError, TypeError) as error:
+        raise EmbeddingVectorValidationError(
+          "runtime embedding response has no vector") from error
+      _validate_runtime_embedding_vector(vector, runtime_manifest)
+
+    def discard_invalid_response_metadata():
+      consume_metadata = getattr(_provider, "consume_response_metadata", None)
+      if callable(consume_metadata):
+        consume_metadata()
+
     response = _invoke(EMBEDDING, "embedding", {
       "input": [normalized_text],
       "model": model,
-    })
+    }, result_validator=validate_response if strict_runtime else None,
+      on_result_validation_error=(
+        discard_invalid_response_metadata if strict_runtime else None))
 
     if cache_outcome == MISS:
       try:
