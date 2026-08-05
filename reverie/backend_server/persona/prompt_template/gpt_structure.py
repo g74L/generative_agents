@@ -10,6 +10,12 @@ import openai
 import time 
 
 from utils import *
+from persona.prompt_template.llm_provider import (
+  chat_completion,
+  embedding,
+  logical_call,
+  text_completion,
+)
 
 openai.api_key = openai_api_key
 
@@ -19,7 +25,7 @@ def temp_sleep(seconds=0.1):
 def ChatGPT_single_request(prompt): 
   temp_sleep()
 
-  completion = openai.ChatCompletion.create(
+  completion = chat_completion(
     model="gpt-3.5-turbo", 
     messages=[{"role": "user", "content": prompt}]
   )
@@ -45,7 +51,7 @@ def GPT4_request(prompt):
   temp_sleep()
 
   try: 
-    completion = openai.ChatCompletion.create(
+    completion = chat_completion(
     model="gpt-4", 
     messages=[{"role": "user", "content": prompt}]
     )
@@ -70,7 +76,7 @@ def ChatGPT_request(prompt):
   """
   # temp_sleep()
   try: 
-    completion = openai.ChatCompletion.create(
+    completion = chat_completion(
     model="gpt-3.5-turbo", 
     messages=[{"role": "user", "content": prompt}]
     )
@@ -98,24 +104,25 @@ def GPT4_safe_generate_response(prompt,
     print ("CHAT GPT PROMPT")
     print (prompt)
 
-  for i in range(repeat): 
+  with logical_call():
+    for i in range(repeat):
 
-    try: 
-      curr_gpt_response = GPT4_request(prompt).strip()
-      end_index = curr_gpt_response.rfind('}') + 1
-      curr_gpt_response = curr_gpt_response[:end_index]
-      curr_gpt_response = json.loads(curr_gpt_response)["output"]
-      
-      if func_validate(curr_gpt_response, prompt=prompt): 
-        return func_clean_up(curr_gpt_response, prompt=prompt)
-      
-      if verbose: 
-        print ("---- repeat count: \n", i, curr_gpt_response)
-        print (curr_gpt_response)
-        print ("~~~~")
+      try:
+        curr_gpt_response = GPT4_request(prompt).strip()
+        end_index = curr_gpt_response.rfind('}') + 1
+        curr_gpt_response = curr_gpt_response[:end_index]
+        curr_gpt_response = json.loads(curr_gpt_response)["output"]
 
-    except: 
-      pass
+        if func_validate(curr_gpt_response, prompt=prompt):
+          return func_clean_up(curr_gpt_response, prompt=prompt)
+
+        if verbose:
+          print ("---- repeat count: \n", i, curr_gpt_response)
+          print (curr_gpt_response)
+          print ("~~~~")
+
+      except:
+        pass
 
   return False
 
@@ -138,28 +145,29 @@ def ChatGPT_safe_generate_response(prompt,
     print ("CHAT GPT PROMPT")
     print (prompt)
 
-  for i in range(repeat): 
+  with logical_call():
+    for i in range(repeat):
 
-    try: 
-      curr_gpt_response = ChatGPT_request(prompt).strip()
-      end_index = curr_gpt_response.rfind('}') + 1
-      curr_gpt_response = curr_gpt_response[:end_index]
-      curr_gpt_response = json.loads(curr_gpt_response)["output"]
+      try:
+        curr_gpt_response = ChatGPT_request(prompt).strip()
+        end_index = curr_gpt_response.rfind('}') + 1
+        curr_gpt_response = curr_gpt_response[:end_index]
+        curr_gpt_response = json.loads(curr_gpt_response)["output"]
 
-      # print ("---ashdfaf")
-      # print (curr_gpt_response)
-      # print ("000asdfhia")
-      
-      if func_validate(curr_gpt_response, prompt=prompt): 
-        return func_clean_up(curr_gpt_response, prompt=prompt)
-      
-      if verbose: 
-        print ("---- repeat count: \n", i, curr_gpt_response)
-        print (curr_gpt_response)
-        print ("~~~~")
+        # print ("---ashdfaf")
+        # print (curr_gpt_response)
+        # print ("000asdfhia")
 
-    except: 
-      pass
+        if func_validate(curr_gpt_response, prompt=prompt):
+          return func_clean_up(curr_gpt_response, prompt=prompt)
+
+        if verbose:
+          print ("---- repeat count: \n", i, curr_gpt_response)
+          print (curr_gpt_response)
+          print ("~~~~")
+
+      except:
+        pass
 
   return False
 
@@ -174,18 +182,19 @@ def ChatGPT_safe_generate_response_OLD(prompt,
     print ("CHAT GPT PROMPT")
     print (prompt)
 
-  for i in range(repeat): 
-    try: 
-      curr_gpt_response = ChatGPT_request(prompt).strip()
-      if func_validate(curr_gpt_response, prompt=prompt): 
-        return func_clean_up(curr_gpt_response, prompt=prompt)
-      if verbose: 
-        print (f"---- repeat count: {i}")
-        print (curr_gpt_response)
-        print ("~~~~")
+  with logical_call():
+    for i in range(repeat):
+      try:
+        curr_gpt_response = ChatGPT_request(prompt).strip()
+        if func_validate(curr_gpt_response, prompt=prompt):
+          return func_clean_up(curr_gpt_response, prompt=prompt)
+        if verbose:
+          print (f"---- repeat count: {i}")
+          print (curr_gpt_response)
+          print ("~~~~")
 
-    except: 
-      pass
+      except:
+        pass
   print ("FAIL SAFE TRIGGERED") 
   return fail_safe_response
 
@@ -208,7 +217,7 @@ def GPT_request(prompt, gpt_parameter):
   """
   temp_sleep()
   try: 
-    response = openai.Completion.create(
+    response = text_completion(
                 model=gpt_parameter["engine"],
                 prompt=prompt,
                 temperature=gpt_parameter["temperature"],
@@ -262,14 +271,15 @@ def safe_generate_response(prompt,
   if verbose: 
     print (prompt)
 
-  for i in range(repeat): 
-    curr_gpt_response = GPT_request(prompt, gpt_parameter)
-    if func_validate(curr_gpt_response, prompt=prompt): 
-      return func_clean_up(curr_gpt_response, prompt=prompt)
-    if verbose: 
-      print ("---- repeat count: ", i, curr_gpt_response)
-      print (curr_gpt_response)
-      print ("~~~~")
+  with logical_call():
+    for i in range(repeat):
+      curr_gpt_response = GPT_request(prompt, gpt_parameter)
+      if func_validate(curr_gpt_response, prompt=prompt):
+        return func_clean_up(curr_gpt_response, prompt=prompt)
+      if verbose:
+        print ("---- repeat count: ", i, curr_gpt_response)
+        print (curr_gpt_response)
+        print ("~~~~")
   return fail_safe_response
 
 
@@ -277,7 +287,7 @@ def get_embedding(text, model="text-embedding-ada-002"):
   text = text.replace("\n", " ")
   if not text: 
     text = "this is blank"
-  return openai.Embedding.create(
+  return embedding(
           input=[text], model=model)['data'][0]['embedding']
 
 

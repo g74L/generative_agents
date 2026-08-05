@@ -11,6 +11,7 @@ from operator import itemgetter
 from global_methods import *
 from persona.prompt_template.gpt_structure import *
 from persona.prompt_template.run_gpt_prompt import *
+from persona.prompt_template.llm_provider import PERCEPTION, embedding_call_context
 
 def generate_poig_score(persona, event_type, description): 
   if "is idle" in description: 
@@ -22,6 +23,7 @@ def generate_poig_score(persona, event_type, description):
     return run_gpt_prompt_chat_poignancy(persona, 
                            persona.scratch.act_description)[0]
 
+@embedding_call_context(PERCEPTION)
 def perceive(persona, maze): 
   """
   Perceives events around the persona and saves it to the memory, both events 

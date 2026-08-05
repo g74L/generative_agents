@@ -16,6 +16,7 @@ from numpy.linalg import norm
 from global_methods import *
 from persona.prompt_template.run_gpt_prompt import *
 from persona.prompt_template.gpt_structure import *
+from persona.prompt_template.llm_provider import REFLECTION, embedding_call_context
 from persona.cognitive_modules.retrieve import *
 
 def generate_focal_points(persona, n=3): 
@@ -169,6 +170,7 @@ def reset_reflection_counter(persona):
   persona.scratch.importance_ele_n = 0
 
 
+@embedding_call_context(REFLECTION)
 def reflect(persona):
   """
   The main reflection module for the persona. We first check if the trigger 

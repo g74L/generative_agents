@@ -17,6 +17,11 @@ from persona.memory_structures.associative_memory import *
 from persona.memory_structures.scratch import *
 from persona.cognitive_modules.retrieve import *
 from persona.prompt_template.run_gpt_prompt import *
+from persona.prompt_template.llm_provider import (
+  CONVERSATION,
+  MEMORY_WRITE,
+  embedding_call_context,
+)
 
 def generate_agent_chat_summarize_ideas(init_persona, 
                                         target_persona, 
@@ -123,6 +128,7 @@ def generate_one_utterance(maze, init_persona, target_persona, retrieved, curr_c
 
   return x["utterance"], x["end"]
 
+@embedding_call_context(CONVERSATION)
 def agent_chat_v2(maze, init_persona, target_persona): 
   curr_chat = []
   print ("July 23")
@@ -236,6 +242,7 @@ def generate_poig_score(persona, event_type, description):
                            persona.scratch.act_description)[0]
 
 
+@embedding_call_context(MEMORY_WRITE)
 def load_history_via_whisper(personas, whispers):
   for count, row in enumerate(whispers): 
     persona = personas[row[0]]

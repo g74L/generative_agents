@@ -9,6 +9,7 @@ sys.path.append('../../')
 
 from global_methods import *
 from persona.prompt_template.gpt_structure import *
+from persona.prompt_template.llm_provider import RETRIEVAL, embedding_call_context
 
 from numpy import dot
 from numpy.linalg import norm
@@ -196,6 +197,7 @@ def extract_relevance(persona, nodes, focal_pt):
   return relevance_out
 
 
+@embedding_call_context(RETRIEVAL, preserve_existing=True)
 def new_retrieve(persona, focal_points, n_count=30): 
   """
   Given the current persona and focal points (focal points are events or 

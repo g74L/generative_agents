@@ -13,6 +13,11 @@ sys.path.append('../../')
 
 from global_methods import *
 from persona.prompt_template.run_gpt_prompt import *
+from persona.prompt_template.llm_provider import (
+  IDENTITY,
+  PLANNING,
+  embedding_call_context,
+)
 from persona.cognitive_modules.retrieve import *
 from persona.cognitive_modules.converse import *
 
@@ -405,6 +410,7 @@ def generate_new_decomp_schedule(persona, inserted_act, inserted_act_dur,  start
 # CHAPTER 3: Plan
 ##############################################################################
 
+@embedding_call_context(IDENTITY)
 def revise_identity(persona): 
   p_name = persona.scratch.name
 
@@ -928,6 +934,7 @@ def _wait_react(persona, reaction_mode):
     act_pronunciatio, act_obj_description, act_obj_pronunciatio, act_obj_event)
 
 
+@embedding_call_context(PLANNING)
 def plan(persona, maze, personas, new_day, retrieved): 
   """
   Main cognitive function of the chain. It takes the retrieved memory and 
