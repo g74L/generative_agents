@@ -10,6 +10,9 @@ import openai
 import time 
 
 from utils import *
+from persona.memory_structures.embedding_space import (
+  get_runtime_embedding_manifest,
+)
 from persona.prompt_template.llm_provider import (
   chat_completion,
   embedding,
@@ -283,7 +286,8 @@ def safe_generate_response(prompt,
   return fail_safe_response
 
 
-def get_embedding(text, model="text-embedding-ada-002"):
+def get_embedding(text, model=None):
+  model = model or get_runtime_embedding_manifest().model
   text = text.replace("\n", " ")
   if not text: 
     text = "this is blank"

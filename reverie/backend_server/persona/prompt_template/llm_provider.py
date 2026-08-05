@@ -19,6 +19,12 @@ from typing import Any, Deque, Dict, Iterator, List, Optional, Protocol, Tuple
 
 import openai
 
+from persona.memory_structures.embedding_space import (
+  LEGACY_ADA_002_MANIFEST,
+  assert_runtime_embedding_request,
+  get_runtime_embedding_manifest,
+)
+
 
 CHAT = "CHAT"
 COMPLETION = "COMPLETION"
@@ -31,7 +37,8 @@ DISABLED = "DISABLED"
 BYPASS = "BYPASS"
 
 EMBEDDING_VERSION = "legacy-embedding-v0"
-EMBEDDING_NORMALIZATION_VERSION = "newline-and-blank-v0"
+EMBEDDING_NORMALIZATION_VERSION = (
+  LEGACY_ADA_002_MANIFEST.normalization_version)
 DEFAULT_EMBEDDING_CACHE_CAPACITY = 1024
 DEFAULT_EMBEDDING_CACHE_ENABLED = True
 
@@ -60,6 +67,9 @@ EMBEDDING_CALL_CATEGORIES = (
 class LLMProvider(Protocol):
   """Transport operations used by the existing legacy wrappers."""
 
+  provider_identity: str
+  embedding_space_provider: Optional[str]
+
   def chat_completion(self, *, model: str, messages: List[Dict[str, str]]) -> Any:
     ...
 
@@ -76,6 +86,7 @@ class OpenAILegacyProvider:
   """Exact adapter for the OpenAI 0.x APIs used by the baseline."""
 
   provider_identity = "openai-legacy"
+  embedding_space_provider = "openai"
 
   def chat_completion(self, *, model, messages):
     return openai.ChatCompletion.create(model=model, messages=messages)
@@ -437,17 +448,24 @@ def _valid_embedding_vector(vector: Any) -> bool:
                   for value in vector))
 
 
-def _cache_key(provider_identity: str, model: str, normalized_text: str):
+def _cache_key(provider_identity: str, model: str, normalization_version: str,
+               normalized_text: str):
   return (
     provider_identity,
     model,
     EMBEDDING_VERSION,
-    EMBEDDING_NORMALIZATION_VERSION,
+    normalization_version,
     normalized_text,
   )
 
 
 def embedding(*, input: List[str], model: str) -> Any:
+  runtime_manifest = get_runtime_embedding_manifest()
+  logical_provider = getattr(_provider, "embedding_space_provider", None)
+  if logical_provider is not None:
+    assert_runtime_embedding_request(
+      logical_provider, model, runtime_manifest.normalization_version,
+      runtime_manifest=runtime_manifest)
   with logical_call() as logical_call_id:
     category = _embedding_call_category.get()
     with _embedding_cache_lock:
@@ -468,12 +486,14 @@ def embedding(*, input: List[str], model: str) -> Any:
 
     normalized_text = _normalize_embedding_text(input[0])
     provider_identity = _provider_identity(_provider)
-    key = _cache_key(provider_identity, model, normalized_text)
+    key = _cache_key(
+      provider_identity, model, runtime_manifest.normalization_version,
+      normalized_text)
     key_fingerprint = _fingerprint({
       "provider_identity": provider_identity,
       "model": model,
       "embedding_version": EMBEDDING_VERSION,
-      "normalization_version": EMBEDDING_NORMALIZATION_VERSION,
+      "normalization_version": runtime_manifest.normalization_version,
       "normalized_text": normalized_text,
     })
 
@@ -532,9 +552,10 @@ class FakeProvider:
 
   _identity_counter = itertools.count(1)
 
-  def __init__(self, provider_identity=None):
+  def __init__(self, provider_identity=None, embedding_space_provider=None):
     self.provider_identity = (provider_identity
                               or f"fake-{next(self._identity_counter)}")
+    self.embedding_space_provider = embedding_space_provider
     self.calls: List[FakeCall] = []
     self._chat_results: Deque[Any] = deque()
     self._completion_results: Deque[Any] = deque()

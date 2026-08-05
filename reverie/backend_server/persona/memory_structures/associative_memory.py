@@ -14,6 +14,12 @@ import json
 import datetime
 
 from global_methods import *
+from persona.memory_structures.embedding_space import (
+  get_runtime_embedding_manifest,
+  load_embedding_store,
+  set_runtime_embedding_manifest,
+  write_embedding_manifest,
+)
 
 
 class ConceptNode: 
@@ -48,7 +54,8 @@ class ConceptNode:
 
 
 class AssociativeMemory: 
-  def __init__(self, f_saved): 
+  def __init__(self, f_saved, legacy_assumption_allowed=True,
+               runtime_embedding_manifest=None):
     self.id_to_node = dict()
 
     self.seq_event = []
@@ -62,9 +69,17 @@ class AssociativeMemory:
     self.kw_strength_event = dict()
     self.kw_strength_thought = dict()
 
-    self.embeddings = json.load(open(f_saved + "/embeddings.json"))
+    resolved_runtime_manifest = (runtime_embedding_manifest
+                                 or get_runtime_embedding_manifest())
+    loaded_store = load_embedding_store(
+      f_saved, legacy_assumption_allowed=legacy_assumption_allowed,
+      runtime_manifest=resolved_runtime_manifest)
+    self.runtime_embedding_manifest = resolved_runtime_manifest
+    self.embedding_space_manifest = loaded_store.manifest
+    self.embedding_space_classification = loaded_store.classification
+    self.embeddings = loaded_store.embeddings
 
-    nodes_load = json.load(open(f_saved + "/nodes.json"))
+    nodes_load = loaded_store.nodes
     for count in range(len(nodes_load.keys())): 
       node_id = f"node_{str(count+1)}"
       node_details = nodes_load[node_id]
@@ -103,10 +118,14 @@ class AssociativeMemory:
                    description, keywords, poignancy, embedding_pair, filling)
 
     kw_strength_load = json.load(open(f_saved + "/kw_strength.json"))
-    if kw_strength_load["kw_strength_event"]: 
+    if "kw_strength_event" in kw_strength_load:
       self.kw_strength_event = kw_strength_load["kw_strength_event"]
-    if kw_strength_load["kw_strength_thought"]: 
+    if "kw_strength_thought" in kw_strength_load:
       self.kw_strength_thought = kw_strength_load["kw_strength_thought"]
+
+    # Only a fully constructed store may configure subsequent embedding calls.
+    if runtime_embedding_manifest is not None:
+      set_runtime_embedding_manifest(runtime_embedding_manifest)
 
     
   def save(self, out_json): 
@@ -148,6 +167,7 @@ class AssociativeMemory:
 
     with open(out_json+"/embeddings.json", "w") as outfile:
       json.dump(self.embeddings, outfile)
+    write_embedding_manifest(out_json, self.embedding_space_manifest)
 
 
   def add_event(self, created, expiration, s, p, o, 
