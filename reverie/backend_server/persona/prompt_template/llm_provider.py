@@ -40,6 +40,7 @@ from persona.prompt_template.llm_provider_config import (
 
 CHAT = "CHAT"
 COMPLETION = "COMPLETION"
+COMPLETION_COMPAT = "COMPLETION_COMPAT"
 EMBEDDING = "EMBEDDING"
 SUCCESS = "SUCCESS"
 ERROR = "ERROR"
@@ -87,7 +88,10 @@ class LLMProvider(Protocol):
   def chat_completion(self, *, model: str, messages: List[Dict[str, str]],
                       temperature: Optional[float] = None,
                       max_tokens: Optional[int] = None, stop: Any = None,
-                      response_format: Any = None) -> Any:
+                      response_format: Any = None,
+                      top_p: Optional[float] = None,
+                      frequency_penalty: Optional[float] = None,
+                      presence_penalty: Optional[float] = None) -> Any:
     ...
 
   def text_completion(self, *, model: str, prompt: str, temperature: float,
@@ -108,11 +112,15 @@ class OpenAILegacyProvider:
   transport_kind = LEGACY_TRANSPORT
 
   def chat_completion(self, *, model, messages, temperature=None,
-                      max_tokens=None, stop=None, response_format=None):
+                      max_tokens=None, stop=None, response_format=None,
+                      top_p=None, frequency_penalty=None,
+                      presence_penalty=None):
     arguments = {"model": model, "messages": messages}
     for name, value in (
         ("temperature", temperature), ("max_tokens", max_tokens),
-        ("stop", stop), ("response_format", response_format)):
+        ("stop", stop), ("response_format", response_format),
+        ("top_p", top_p), ("frequency_penalty", frequency_penalty),
+        ("presence_penalty", presence_penalty)):
       if value is not None:
         arguments[name] = value
     return openai.ChatCompletion.create(**arguments)
@@ -155,6 +163,34 @@ class TelemetryEvent:
   output_tokens: Optional[int] = None
   cached_input_tokens: Optional[int] = None
   reasoning_tokens: Optional[int] = None
+  caller_id: Optional[str] = None
+  cognitive_category: Optional[str] = None
+  actor_id: Optional[str] = None
+  simulation_id: Optional[str] = None
+  simulation_step: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class LLMReplayContext:
+  """Immutable replay attribution captured with each physical LLM attempt."""
+  caller_id: Optional[str] = None
+  cognitive_category: Optional[str] = None
+  actor_id: Optional[str] = None
+  simulation_id: Optional[str] = None
+  simulation_step: Optional[int] = None
+
+  def __post_init__(self):
+    for field_name in (
+        "caller_id", "cognitive_category", "actor_id", "simulation_id"):
+      value = getattr(self, field_name)
+      if value is not None and (
+          not isinstance(value, str) or not value.strip() or len(value) > 512):
+        raise ValueError(f"{field_name} must be non-blank text or None")
+    if (self.simulation_step is not None
+        and (type(self.simulation_step) is not int
+             or self.simulation_step < 0)):
+      raise ValueError(
+        "simulation_step must be a non-negative integer or None")
 
 
 @dataclass(frozen=True)
@@ -187,10 +223,14 @@ class _LogicalCallState:
 
 _logical_call_state: ContextVar[Optional[_LogicalCallState]] = ContextVar(
   "legacy_llm_logical_call", default=None)
+_llm_replay_context: ContextVar[LLMReplayContext] = ContextVar(
+  "llm_replay_context", default=LLMReplayContext())
 _chat_provider_override: ContextVar[Optional[LLMProvider]] = ContextVar(
   "chat_provider_override", default=None)
 _completion_provider_override: ContextVar[Optional[LLMProvider]] = ContextVar(
   "completion_provider_override", default=None)
+_completion_compat_provider_override: ContextVar[Optional[LLMProvider]] = (
+  ContextVar("completion_compat_provider_override", default=None))
 _embedding_provider_override: ContextVar[Optional[LLMProvider]] = ContextVar(
   "embedding_provider_override", default=None)
 _provider_operation_scope = ContextVar(
@@ -240,6 +280,11 @@ def get_chat_provider() -> LLMProvider:
 def get_completion_provider() -> LLMProvider:
   provider = _completion_provider_override.get()
   return provider if provider is not None else _general_provider_for(COMPLETION)
+
+
+def get_completion_compat_provider() -> Optional[LLMProvider]:
+  """Return only an explicitly scoped CompletionCompat provider."""
+  return _completion_compat_provider_override.get()
 
 
 def get_embedding_provider() -> LLMProvider:
@@ -307,6 +352,16 @@ def use_completion_provider(provider: LLMProvider) -> Iterator[LLMProvider]:
 
 
 @contextmanager
+def use_completion_compat_provider(
+    provider: LLMProvider) -> Iterator[LLMProvider]:
+  token = _completion_compat_provider_override.set(provider)
+  try:
+    yield provider
+  finally:
+    _completion_compat_provider_override.reset(token)
+
+
+@contextmanager
 def use_embedding_provider(provider: LLMProvider) -> Iterator[LLMProvider]:
   token = _embedding_provider_override.set(provider)
   try:
@@ -329,6 +384,22 @@ def logical_call() -> Iterator[str]:
     yield state.call_id
   finally:
     _logical_call_state.reset(token)
+
+
+def get_llm_replay_context() -> LLMReplayContext:
+  return _llm_replay_context.get()
+
+
+@contextmanager
+def use_llm_replay_context(
+    context: LLMReplayContext) -> Iterator[LLMReplayContext]:
+  if not isinstance(context, LLMReplayContext):
+    raise TypeError("context must be LLMReplayContext")
+  token = _llm_replay_context.set(context)
+  try:
+    yield context
+  finally:
+    _llm_replay_context.reset(token)
 
 
 @contextmanager
@@ -503,10 +574,14 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any],
   active_provider = {
     CHAT: get_chat_provider,
     COMPLETION: get_completion_provider,
+    COMPLETION_COMPAT: get_completion_compat_provider,
     EMBEDDING: get_embedding_provider,
   }[operation]()
+  if active_provider is None:
+    raise RuntimeError("CompletionCompat provider is not configured")
   provider_kind = getattr(active_provider, "provider_kind", None)
   transport_kind = getattr(active_provider, "transport_kind", None)
+  replay_context = get_llm_replay_context()
   try:
     result = getattr(active_provider, method_name)(**kwargs)
     if result_validator is not None:
@@ -533,6 +608,11 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any],
       provider_kind=provider_kind,
       transport_kind=transport_kind,
       request_id=error_request_id,
+      caller_id=replay_context.caller_id,
+      cognitive_category=replay_context.cognitive_category,
+      actor_id=replay_context.actor_id,
+      simulation_id=replay_context.simulation_id,
+      simulation_step=replay_context.simulation_step,
     ))
     raise
 
@@ -558,6 +638,11 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any],
     output_tokens=getattr(metadata, "output_tokens", None),
     cached_input_tokens=getattr(metadata, "cached_input_tokens", None),
     reasoning_tokens=getattr(metadata, "reasoning_tokens", None),
+    caller_id=replay_context.caller_id,
+    cognitive_category=replay_context.cognitive_category,
+    actor_id=replay_context.actor_id,
+    simulation_id=replay_context.simulation_id,
+    simulation_step=replay_context.simulation_step,
   ))
   return result
 
@@ -566,15 +651,43 @@ def chat_completion(*, model: str, messages: List[Dict[str, str]],
                     temperature: Optional[float] = None,
                     max_tokens: Optional[int] = None, stop: Any = None,
                     response_format: Any = None, result_validator=None,
-                    on_result_validation_error=None) -> Any:
+                    on_result_validation_error=None,
+                    top_p: Optional[float] = None,
+                    frequency_penalty: Optional[float] = None,
+                    presence_penalty: Optional[float] = None) -> Any:
   arguments = {"model": model, "messages": messages}
   for name, value in (
       ("temperature", temperature), ("max_tokens", max_tokens),
-      ("stop", stop), ("response_format", response_format)):
+      ("stop", stop), ("response_format", response_format),
+      ("top_p", top_p), ("frequency_penalty", frequency_penalty),
+      ("presence_penalty", presence_penalty)):
     if value is not None:
       arguments[name] = value
   return _invoke(
     CHAT, "chat_completion", arguments,
+    result_validator=result_validator,
+    on_result_validation_error=on_result_validation_error)
+
+
+def completion_compat(*, model: str, prompt: str, temperature: float,
+                      max_tokens: int, top_p: float,
+                      frequency_penalty: float, presence_penalty: float,
+                      stop: Any, result_validator=None,
+                      on_result_validation_error=None) -> Any:
+  """Execute a legacy prompt through an explicitly scoped modern Chat seam."""
+  arguments = {
+    "model": model,
+    "messages": [{"role": "user", "content": prompt}],
+    "temperature": temperature,
+    "max_tokens": max_tokens,
+    "top_p": top_p,
+    "frequency_penalty": frequency_penalty,
+    "presence_penalty": presence_penalty,
+  }
+  if stop is not None:
+    arguments["stop"] = stop
+  return _invoke(
+    COMPLETION_COMPAT, "chat_completion", arguments,
     result_validator=result_validator,
     on_result_validation_error=on_result_validation_error)
 
@@ -802,11 +915,15 @@ class FakeProvider:
     return result
 
   def chat_completion(self, *, model, messages, temperature=None,
-                      max_tokens=None, stop=None, response_format=None):
+                      max_tokens=None, stop=None, response_format=None,
+                      top_p=None, frequency_penalty=None,
+                      presence_penalty=None):
     arguments = {"model": model, "messages": messages}
     for name, value in (
         ("temperature", temperature), ("max_tokens", max_tokens),
-        ("stop", stop), ("response_format", response_format)):
+        ("stop", stop), ("response_format", response_format),
+        ("top_p", top_p), ("frequency_penalty", frequency_penalty),
+        ("presence_penalty", presence_penalty)):
       if value is not None:
         arguments[name] = value
     return self._next(CHAT, self._chat_results, arguments)

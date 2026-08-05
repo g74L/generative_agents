@@ -395,7 +395,9 @@ class ModernOpenAIClientAdapter:
     self.client = client if client is not None else factory(self.config)
 
   def create_chat(self, *, model, messages, temperature=None,
-                  max_tokens=None, stop=None, response_format=None):
+                  max_tokens=None, stop=None, response_format=None,
+                  top_p=None, frequency_penalty=None,
+                  presence_penalty=None):
     arguments = {
       "model": model,
       "messages": messages,
@@ -403,7 +405,9 @@ class ModernOpenAIClientAdapter:
     }
     for name, value in (
         ("temperature", temperature), ("max_tokens", max_tokens),
-        ("stop", stop), ("response_format", response_format)):
+        ("stop", stop), ("response_format", response_format),
+        ("top_p", top_p), ("frequency_penalty", frequency_penalty),
+        ("presence_penalty", presence_penalty)):
       if value is not None:
         arguments[name] = value
     try:
@@ -460,11 +464,15 @@ class ModernOpenAIProvider:
     return metadata
 
   def chat_completion(self, *, model, messages, temperature=None,
-                      max_tokens=None, stop=None, response_format=None):
+                      max_tokens=None, stop=None, response_format=None,
+                      top_p=None, frequency_penalty=None,
+                      presence_penalty=None):
     response = validate_normalized_text_response(
       self.client_adapter.create_chat(
       model=model, messages=messages, temperature=temperature,
-      max_tokens=max_tokens, stop=stop, response_format=response_format))
+      max_tokens=max_tokens, stop=stop, response_format=response_format,
+      top_p=top_p, frequency_penalty=frequency_penalty,
+      presence_penalty=presence_penalty))
     metadata = self._remember(response)
     return {
       "choices": [{

@@ -225,7 +225,7 @@ def _validated_optional_result_text(value, field_name, max_length=512):
   return value
 
 
-def _validate_provider_result(response):
+def validate_modern_chat_provider_result(response):
   try:
     choice = response["choices"][0]
     content = choice["message"]["content"]
@@ -265,7 +265,7 @@ def _validate_provider_result(response):
 
 
 def _result_from_provider(response, requested_model):
-  _validate_provider_result(response)
+  validate_modern_chat_provider_result(response)
   content = response["choices"][0]["message"]["content"]
   finish_reason = response["choices"][0].get("finish_reason")
   metadata = response["_normalized_metadata"]
@@ -301,7 +301,7 @@ def run_modern_chat(request, validator: Optional[Callable[[str], bool]] = None):
     for attempt in range(config.application_retry_count + 1):
       try:
         def validate_result(response):
-          _validate_provider_result(response)
+          validate_modern_chat_provider_result(response)
           if validator is not None:
             content = response["choices"][0]["message"]["content"]
             if not validator(content):

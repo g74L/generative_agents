@@ -116,8 +116,15 @@ class CostLedgerContext:
   simulation_step: Optional[int] = None
   actor_id: Optional[str] = None
   cognitive_category: Optional[str] = None
+  caller_id: Optional[str] = None
 
   def __post_init__(self):
+    for field_name in (
+        "simulation_id", "actor_id", "cognitive_category", "caller_id"):
+      value = getattr(self, field_name)
+      if value is not None and (
+          not isinstance(value, str) or not value.strip() or len(value) > 512):
+        raise ValueError(f"{field_name} must be non-blank text or None")
     if (self.simulation_step is not None
         and (type(self.simulation_step) is not int
              or self.simulation_step < 0)):
@@ -180,6 +187,7 @@ class CostLedgerRecord:
   estimated_cached_input_cost_usd: Optional[Decimal]
   estimated_output_cost_usd: Optional[Decimal]
   estimated_total_cost_usd: Optional[Decimal]
+  caller_id: Optional[str]
   cognitive_category: Optional[str]
   actor_id: Optional[str]
   simulation_id: Optional[str]
@@ -512,11 +520,21 @@ def build_cost_ledger_records(
     if (not isinstance(elapsed, (int, float, Decimal))
         or isinstance(elapsed, bool) or elapsed < 0):
       raise ValueError("elapsed_seconds must be non-negative")
-    context = _coerce_context(
+    late_context = _coerce_context(
       context_resolver(event) if context_resolver else get_cost_ledger_context())
-    category = context.cognitive_category
+    event_bound = _event_field(event, "caller_id") is not None
+    caller_id = (_event_field(event, "caller_id") if event_bound
+                 else late_context.caller_id)
+    category = (_event_field(event, "cognitive_category") if event_bound
+                else late_context.cognitive_category)
     if category is None:
       category = category_by_call.get(logical_call_id)
+    actor_id = (_event_field(event, "actor_id") if event_bound
+                else late_context.actor_id)
+    simulation_id = (_event_field(event, "simulation_id") if event_bound
+                     else late_context.simulation_id)
+    simulation_step = (_event_field(event, "simulation_step") if event_bound
+                       else late_context.simulation_step)
     usage, total_tokens, token_status = _token_usage(
       event, operation, outcome)
     model = (_event_field(event, "response_model")
@@ -553,10 +571,11 @@ def build_cost_ledger_records(
       estimated_cached_input_cost_usd=costs[1],
       estimated_output_cost_usd=costs[2],
       estimated_total_cost_usd=costs[3],
+      caller_id=caller_id,
       cognitive_category=category,
-      actor_id=context.actor_id,
-      simulation_id=context.simulation_id,
-      simulation_step=context.simulation_step,
+      actor_id=actor_id,
+      simulation_id=simulation_id,
+      simulation_step=simulation_step,
       created_at=None,
     ))
   return tuple(records)

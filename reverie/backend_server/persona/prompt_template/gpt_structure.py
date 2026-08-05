@@ -9,9 +9,14 @@ import random
 import openai
 import time 
 
-from utils import *
 from persona.memory_structures.embedding_space import (
   get_runtime_embedding_manifest,
+)
+from persona.prompt_template.completion_runtime import (
+  CompletionCompatCallerNotAllowedError,
+  LegacyModelInvocationDetectedError,
+  is_modern_completion_runtime_active,
+  run_legacy_completion_compat,
 )
 from persona.prompt_template.llm_provider import (
   chat_completion,
@@ -19,8 +24,6 @@ from persona.prompt_template.llm_provider import (
   logical_call,
   text_completion,
 )
-
-openai.api_key = openai_api_key
 
 def temp_sleep(seconds=0.1):
   time.sleep(seconds)
@@ -206,7 +209,7 @@ def ChatGPT_safe_generate_response_OLD(prompt,
 # ###################[SECTION 2: ORIGINAL GPT-3 STRUCTURE] ###################
 # ============================================================================
 
-def GPT_request(prompt, gpt_parameter): 
+def GPT_request(prompt, gpt_parameter, *, caller_id=None):
   """
   Given a prompt and a dictionary of GPT parameters, make a request to OpenAI
   server and returns the response. 
@@ -220,6 +223,9 @@ def GPT_request(prompt, gpt_parameter):
   """
   temp_sleep()
   try: 
+    if is_modern_completion_runtime_active():
+      return run_legacy_completion_compat(
+        prompt, gpt_parameter, caller_id=caller_id)
     response = text_completion(
                 model=gpt_parameter["engine"],
                 prompt=prompt,
@@ -231,6 +237,9 @@ def GPT_request(prompt, gpt_parameter):
                 stream=gpt_parameter["stream"],
                 stop=gpt_parameter["stop"],)
     return response.choices[0].text
+  except (CompletionCompatCallerNotAllowedError,
+          LegacyModelInvocationDetectedError):
+    raise
   except: 
     print ("TOKEN LIMIT EXCEEDED")
     return "TOKEN LIMIT EXCEEDED"
@@ -270,13 +279,15 @@ def safe_generate_response(prompt,
                            fail_safe_response="error",
                            func_validate=None,
                            func_clean_up=None,
-                           verbose=False): 
+                           verbose=False,
+                           *, caller_id=None):
   if verbose: 
     print (prompt)
 
   with logical_call():
     for i in range(repeat):
-      curr_gpt_response = GPT_request(prompt, gpt_parameter)
+      curr_gpt_response = GPT_request(
+        prompt, gpt_parameter, caller_id=caller_id)
       if func_validate(curr_gpt_response, prompt=prompt):
         return func_clean_up(curr_gpt_response, prompt=prompt)
       if verbose:
