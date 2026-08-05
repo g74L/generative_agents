@@ -103,6 +103,18 @@ class LLMProvider(Protocol):
     ...
 
 
+class LLMAttemptObserver(Protocol):
+  """Optional orchestration hook around validated physical LLM attempts."""
+
+  def before_attempt(self, *, operation: str, model: str,
+                     logical_call_id: str, physical_attempt: int,
+                     replay_context: "LLMReplayContext") -> None:
+    ...
+
+  def after_attempt(self, event: "TelemetryEvent") -> None:
+    ...
+
+
 class OpenAILegacyProvider:
   """Exact adapter for the OpenAI 0.x APIs used by the baseline."""
 
@@ -233,6 +245,8 @@ _completion_compat_provider_override: ContextVar[Optional[LLMProvider]] = (
   ContextVar("completion_compat_provider_override", default=None))
 _embedding_provider_override: ContextVar[Optional[LLMProvider]] = ContextVar(
   "embedding_provider_override", default=None)
+_llm_attempt_observer: ContextVar[Optional[LLMAttemptObserver]] = ContextVar(
+  "llm_attempt_observer", default=None)
 _provider_operation_scope = ContextVar(
   "provider_operation_scope", default=None)
 _provider_operation_fallback = ContextVar(
@@ -368,6 +382,31 @@ def use_embedding_provider(provider: LLMProvider) -> Iterator[LLMProvider]:
     yield provider
   finally:
     _embedding_provider_override.reset(token)
+
+
+def get_llm_attempt_observer() -> Optional[LLMAttemptObserver]:
+  return _llm_attempt_observer.get()
+
+
+def install_llm_attempt_observer(observer: LLMAttemptObserver):
+  """Install an orchestration observer and return its ContextVar token."""
+  if observer is None:
+    raise TypeError("observer is required")
+  return _llm_attempt_observer.set(observer)
+
+
+def reset_llm_attempt_observer(token) -> None:
+  _llm_attempt_observer.reset(token)
+
+
+@contextmanager
+def use_llm_attempt_observer(
+    observer: LLMAttemptObserver) -> Iterator[LLMAttemptObserver]:
+  token = install_llm_attempt_observer(observer)
+  try:
+    yield observer
+  finally:
+    reset_llm_attempt_observer(token)
 
 
 @contextmanager
@@ -561,14 +600,7 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any],
         result_validator=result_validator,
         on_result_validation_error=on_result_validation_error)
 
-  state.physical_attempts += 1
-  if operation == EMBEDDING:
-    with _embedding_cache_lock:
-      _embedding_cache_stats["physical_embedding_attempts"] += 1
-      category = _embedding_call_category.get()
-      _embedding_category_stats[category]["physical_attempts"] += 1
-  attempt = state.physical_attempts
-  started = time.perf_counter()
+  attempt = state.physical_attempts + 1
   fingerprint = _fingerprint(kwargs)
   model_or_engine = str(kwargs.get("model", ""))
   active_provider = {
@@ -582,6 +614,19 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any],
   provider_kind = getattr(active_provider, "provider_kind", None)
   transport_kind = getattr(active_provider, "transport_kind", None)
   replay_context = get_llm_replay_context()
+  attempt_observer = get_llm_attempt_observer()
+  if attempt_observer is not None:
+    attempt_observer.before_attempt(
+      operation=operation, model=model_or_engine,
+      logical_call_id=state.call_id, physical_attempt=attempt,
+      replay_context=replay_context)
+  state.physical_attempts = attempt
+  if operation == EMBEDDING:
+    with _embedding_cache_lock:
+      _embedding_cache_stats["physical_embedding_attempts"] += 1
+      category = _embedding_call_category.get()
+      _embedding_category_stats[category]["physical_attempts"] += 1
+  started = time.perf_counter()
   try:
     result = getattr(active_provider, method_name)(**kwargs)
     if result_validator is not None:
@@ -596,7 +641,7 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any],
     if (not isinstance(error_request_id, str)
         or not error_request_id.strip() or len(error_request_id) > 512):
       error_request_id = None
-    _telemetry.append(TelemetryEvent(
+    event = TelemetryEvent(
       operation=operation,
       logical_call_id=state.call_id,
       physical_attempt=attempt,
@@ -613,14 +658,17 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any],
       actor_id=replay_context.actor_id,
       simulation_id=replay_context.simulation_id,
       simulation_step=replay_context.simulation_step,
-    ))
+    )
+    _telemetry.append(event)
+    if attempt_observer is not None:
+      attempt_observer.after_attempt(event)
     raise
 
   metadata = None
   consume_metadata = getattr(active_provider, "consume_response_metadata", None)
   if callable(consume_metadata):
     metadata = consume_metadata()
-  _telemetry.append(TelemetryEvent(
+  event = TelemetryEvent(
     operation=operation,
     logical_call_id=state.call_id,
     physical_attempt=attempt,
@@ -643,7 +691,10 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any],
     actor_id=replay_context.actor_id,
     simulation_id=replay_context.simulation_id,
     simulation_step=replay_context.simulation_step,
-  ))
+  )
+  _telemetry.append(event)
+  if attempt_observer is not None:
+    attempt_observer.after_attempt(event)
   return result
 
 
