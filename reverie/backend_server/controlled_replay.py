@@ -4,6 +4,8 @@ R0H deliberately supports one actor, one step, and the historical wake-up-hour
 planning wrapper.  It composes existing modern runtimes and persistence seams;
 it does not alter cognition or provide a general replay framework.
 """
+import ast
+from collections import Counter
 from contextlib import contextmanager, redirect_stdout
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -14,9 +16,21 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 from typing import Any, Optional, Tuple
+import warnings
 
-from persona.memory_structures.embedding_space import EmbeddingSpaceManifest
+from persona.memory_structures.embedding_space import (
+  EMBEDDING_MANIFEST_FILENAME,
+  EmbeddingManifestError,
+  EmbeddingReferenceError,
+  EmbeddingSpaceManifest,
+  EmbeddingSpaceMismatchError,
+  EmbeddingVectorValidationError,
+  LEGACY_ADA_002_MANIFEST,
+  load_embedding_store,
+  read_embedding_manifest,
+)
 from persona.memory_structures.scratch import Scratch
 from persona.prompt_template import run_gpt_prompt
 from persona.prompt_template.chat_runtime import (
@@ -129,6 +143,576 @@ class ControlledReplayLegacyConfigurationError(
 
 class ControlledReplayPathForbiddenError(ControlledReplayError):
   pass
+
+
+class IsolatedFixturePreflightError(ControlledReplayConfigurationError):
+  """Typed failure raised before an isolated tick can reach cognition."""
+
+  def __init__(self, reason_code, message):
+    self.reason_code = reason_code
+    super().__init__(message)
+
+
+@dataclass(frozen=True)
+class IsolatedReverieFixture:
+  temporary_root: Path
+  baseline_root: Path
+  simulation_root: Path
+  environment_step_path: Path
+  personas_dir: Path
+  reverie_dir: Path
+  movement_dir: Path
+
+
+MODERN_COMPATIBLE = "MODERN_COMPATIBLE"
+EMPTY_BOOTSTRAPPABLE = "EMPTY_BOOTSTRAPPABLE"
+LEGACY_NONEMPTY_BLOCKED = "LEGACY_NONEMPTY_BLOCKED"
+INCONSISTENT_BLOCKED = "INCONSISTENT_BLOCKED"
+UNKNOWN_BLOCKED = "UNKNOWN_BLOCKED"
+ISOLATED_FIXTURE_PERSONAS = (
+  "Isabella Rodriguez", "Maria Lopez", "Klaus Mueller")
+
+
+class IsolatedEmbeddingPreflightError(IsolatedFixturePreflightError):
+  def __init__(self, reason_code, message, audits=()):
+    self.audits = tuple(audits)
+    super().__init__(reason_code, message)
+
+
+@dataclass(frozen=True)
+class IsolatedEmbeddingStoreAudit:
+  persona_name: str
+  store_path: Path
+  manifest_present: bool
+  source_classification: str
+  classification: str
+  provider: Optional[str]
+  model: Optional[str]
+  dimensions: Optional[int]
+  embedding_space_version: Optional[str]
+  normalization_version: Optional[str]
+  embedding_count: int
+  node_count: int
+  keyword_strength_entries: int
+  embedding_reference_count: int
+  orphan_embedding_count: int
+  nonempty_vector_count: int
+  observed_dimensions: Tuple[int, ...]
+  internal_mismatch: bool
+
+
+@dataclass(frozen=True)
+class IsolatedEmbeddingPreflightResult:
+  audits_before: Tuple[IsolatedEmbeddingStoreAudit, ...]
+  audits_after: Tuple[IsolatedEmbeddingStoreAudit, ...]
+  bootstrapped_personas: Tuple[str, ...]
+
+
+def _path_is_within(path, parent):
+  return path == parent or parent in path.parents
+
+
+def prepare_isolated_reverie_fixture(simulation_root, temporary_root,
+                                     baseline_root, source_step,
+                                     movement_dir=None):
+  """Validate an isolated simulation copy and create its movement directory.
+
+  This is intentionally a filesystem-only preflight.  Callers must invoke it
+  before constructing ``ReverieServer`` or entering any provider context.
+  """
+  if type(source_step) is not int or source_step < 0:
+    raise IsolatedFixturePreflightError(
+      "INVALID_SOURCE_STEP", "source_step must be a non-negative integer")
+
+  temporary_root = Path(temporary_root).resolve()
+  baseline_root = Path(baseline_root).resolve()
+  simulation_root = Path(simulation_root).resolve()
+  repository_root = Path(__file__).resolve().parents[2]
+  protected_storage = (
+    repository_root / "environment" / "frontend_server" / "storage"
+  ).resolve()
+
+  if not temporary_root.is_dir():
+    raise IsolatedFixturePreflightError(
+      "TEMPORARY_ROOT_MISSING", "isolated temporary root does not exist")
+  if not simulation_root.is_dir():
+    raise IsolatedFixturePreflightError(
+      "SIMULATION_ROOT_MISSING", "isolated simulation root does not exist")
+  if not baseline_root.is_dir():
+    raise IsolatedFixturePreflightError(
+      "BASELINE_ROOT_MISSING", "baseline simulation root does not exist")
+  if not _path_is_within(simulation_root, temporary_root):
+    raise IsolatedFixturePreflightError(
+      "SIMULATION_OUTSIDE_TEMPORARY_ROOT",
+      "isolated simulation root resolves outside the temporary root")
+  if simulation_root == baseline_root:
+    raise IsolatedFixturePreflightError(
+      "SIMULATION_IS_BASELINE",
+      "isolated simulation root must differ from the baseline")
+  if (_path_is_within(simulation_root, protected_storage)
+      or _path_is_within(protected_storage, simulation_root)):
+    raise IsolatedFixturePreflightError(
+      "PROTECTED_STORAGE_TARGET",
+      "protected repository storage cannot be an isolated output target")
+
+  environment_dir = (simulation_root / "environment").resolve()
+  environment_step_path = (environment_dir / f"{source_step}.json").resolve()
+  personas_dir = (simulation_root / "personas").resolve()
+  reverie_dir = (simulation_root / "reverie").resolve()
+  requested_movement = (Path(movement_dir) if movement_dir is not None
+                        else simulation_root / "movement").resolve()
+  fixture_paths = (
+    environment_dir, environment_step_path, personas_dir, reverie_dir,
+    requested_movement,
+  )
+  if any(not _path_is_within(path, simulation_root) for path in fixture_paths):
+    raise IsolatedFixturePreflightError(
+      "FIXTURE_PATH_OUTSIDE_SIMULATION",
+      "an isolated fixture path resolves outside the simulation root")
+  if requested_movement != (simulation_root / "movement").resolve():
+    raise IsolatedFixturePreflightError(
+      "EXTERNAL_MOVEMENT_TARGET",
+      "movement output must be the simulation-local movement directory")
+
+  required_dirs = (
+    (environment_dir, "ENVIRONMENT_DIR_MISSING", "environment"),
+    (personas_dir, "PERSONAS_DIR_MISSING", "personas"),
+    (reverie_dir, "REVERIE_DIR_MISSING", "reverie"),
+  )
+  for path, reason_code, label in required_dirs:
+    if not path.is_dir():
+      raise IsolatedFixturePreflightError(
+        reason_code, f"isolated {label} directory does not exist")
+  if not environment_step_path.is_file():
+    raise IsolatedFixturePreflightError(
+      "SOURCE_ENVIRONMENT_STEP_MISSING",
+      "source environment step does not exist")
+
+  try:
+    requested_movement.mkdir(parents=True, exist_ok=True)
+  except OSError as exc:
+    raise IsolatedFixturePreflightError(
+      "MOVEMENT_DIRECTORY_CREATION_FAILED",
+      "isolated movement directory could not be created") from exc
+  if not requested_movement.is_dir() or not os.access(requested_movement,
+                                                       os.W_OK):
+    raise IsolatedFixturePreflightError(
+      "MOVEMENT_DIRECTORY_NOT_WRITABLE",
+      "isolated movement directory is not writable")
+
+  return IsolatedReverieFixture(
+    temporary_root=temporary_root,
+    baseline_root=baseline_root,
+    simulation_root=simulation_root,
+    environment_step_path=environment_step_path,
+    personas_dir=personas_dir,
+    reverie_dir=reverie_dir,
+    movement_dir=requested_movement,
+  )
+
+
+def _embedding_audit_failure(persona_name, store_path, classification,
+                             manifest=None):
+  return IsolatedEmbeddingStoreAudit(
+    persona_name=persona_name,
+    store_path=store_path,
+    manifest_present=(store_path / EMBEDDING_MANIFEST_FILENAME).is_file(),
+    source_classification="UNKNOWN",
+    classification=classification,
+    provider=getattr(manifest, "provider", None),
+    model=getattr(manifest, "model", None),
+    dimensions=getattr(manifest, "dimensions", None),
+    embedding_space_version=getattr(
+      manifest, "embedding_space_version", None),
+    normalization_version=getattr(manifest, "normalization_version", None),
+    embedding_count=0, node_count=0, keyword_strength_entries=0,
+    embedding_reference_count=0, orphan_embedding_count=0,
+    nonempty_vector_count=0, observed_dimensions=(),
+    internal_mismatch=(classification == INCONSISTENT_BLOCKED),
+  )
+
+
+def inspect_isolated_embedding_store(persona_name, store_path,
+                                     simulation_root):
+  """Return content-free embedding metadata for one isolated Persona store."""
+  store_path = Path(store_path).resolve()
+  simulation_root = Path(simulation_root).resolve()
+  if not _path_is_within(store_path, simulation_root):
+    return _embedding_audit_failure(
+      persona_name, store_path, UNKNOWN_BLOCKED)
+  expected = (simulation_root / "personas" / persona_name
+              / "bootstrap_memory" / "associative_memory").resolve()
+  if store_path != expected or not store_path.is_dir():
+    return _embedding_audit_failure(
+      persona_name, store_path, UNKNOWN_BLOCKED)
+
+  try:
+    embeddings = json.loads(
+      (store_path / "embeddings.json").read_text(encoding="utf-8"))
+    nodes = json.loads(
+      (store_path / "nodes.json").read_text(encoding="utf-8"))
+    keyword_strength = json.loads(
+      (store_path / "kw_strength.json").read_text(encoding="utf-8"))
+  except (OSError, ValueError, TypeError):
+    return _embedding_audit_failure(
+      persona_name, store_path, UNKNOWN_BLOCKED)
+  if (not isinstance(embeddings, dict) or not isinstance(nodes, dict)
+      or not isinstance(keyword_strength, dict)):
+    return _embedding_audit_failure(
+      persona_name, store_path, UNKNOWN_BLOCKED)
+
+  manifest_path = store_path / EMBEDDING_MANIFEST_FILENAME
+  manifest = None
+  source_classification = "DECLARED" if manifest_path.is_file() else "UNKNOWN"
+  if manifest_path.is_file():
+    try:
+      manifest = read_embedding_manifest(manifest_path)
+    except EmbeddingManifestError:
+      return _embedding_audit_failure(
+        persona_name, store_path, UNKNOWN_BLOCKED)
+  elif (store_path.name == "associative_memory"
+        and store_path.parent.name == "bootstrap_memory"
+        and set(keyword_strength) == {
+          "kw_strength_event", "kw_strength_thought"}):
+    manifest = LEGACY_ADA_002_MANIFEST
+    source_classification = "LEGACY_ASSUMED"
+  else:
+    return _embedding_audit_failure(
+      persona_name, store_path, UNKNOWN_BLOCKED)
+
+  references = []
+  missing_reference = False
+  for node in nodes.values():
+    if not isinstance(node, dict) or "embedding_key" not in node:
+      missing_reference = True
+      continue
+    references.append(node["embedding_key"])
+    if node["embedding_key"] not in embeddings:
+      missing_reference = True
+  orphan_count = len(set(embeddings) - set(references))
+  nonempty_vectors = tuple(
+    vector for vector in embeddings.values()
+    if isinstance(vector, (list, tuple)) and bool(vector))
+  observed_dimensions = tuple(sorted({len(vector)
+                                      for vector in nonempty_vectors}))
+  keyword_entries = sum(
+    len(value) for value in keyword_strength.values()
+    if isinstance(value, dict))
+  malformed_vector = any(
+    not isinstance(vector, (list, tuple)) or not vector
+    for vector in embeddings.values())
+  internal_mismatch = (
+    missing_reference or orphan_count > 0 or malformed_vector
+    or any(length != manifest.dimensions for length in observed_dimensions)
+    or any(not isinstance(value, dict) for value in keyword_strength.values())
+  )
+
+  completely_empty = (
+    not embeddings and not nodes and not references
+    and not nonempty_vectors and keyword_entries == 0)
+  if internal_mismatch:
+    classification = INCONSISTENT_BLOCKED
+  elif (completely_empty
+        and manifest == TEXT_EMBEDDING_3_SMALL_1536_MANIFEST):
+    try:
+      load_embedding_store(
+        store_path, legacy_assumption_allowed=False,
+        runtime_manifest=TEXT_EMBEDDING_3_SMALL_1536_MANIFEST)
+      classification = MODERN_COMPATIBLE
+    except (EmbeddingManifestError, EmbeddingReferenceError,
+            EmbeddingSpaceMismatchError, EmbeddingVectorValidationError):
+      classification = INCONSISTENT_BLOCKED
+  elif completely_empty:
+    classification = EMPTY_BOOTSTRAPPABLE
+  else:
+    try:
+      if manifest == TEXT_EMBEDDING_3_SMALL_1536_MANIFEST:
+        load_embedding_store(
+          store_path, legacy_assumption_allowed=False,
+          runtime_manifest=TEXT_EMBEDDING_3_SMALL_1536_MANIFEST)
+        classification = MODERN_COMPATIBLE
+      elif manifest == LEGACY_ADA_002_MANIFEST:
+        with warnings.catch_warnings():
+          warnings.simplefilter("ignore")
+          load_embedding_store(
+            store_path, legacy_assumption_allowed=True,
+            runtime_manifest=LEGACY_ADA_002_MANIFEST)
+        classification = LEGACY_NONEMPTY_BLOCKED
+      else:
+        classification = UNKNOWN_BLOCKED
+    except (EmbeddingManifestError, EmbeddingReferenceError,
+            EmbeddingSpaceMismatchError, EmbeddingVectorValidationError):
+      classification = INCONSISTENT_BLOCKED
+
+  return IsolatedEmbeddingStoreAudit(
+    persona_name=persona_name,
+    store_path=store_path,
+    manifest_present=manifest_path.is_file(),
+    source_classification=source_classification,
+    classification=classification,
+    provider=manifest.provider,
+    model=manifest.model,
+    dimensions=manifest.dimensions,
+    embedding_space_version=manifest.embedding_space_version,
+    normalization_version=manifest.normalization_version,
+    embedding_count=len(embeddings),
+    node_count=len(nodes),
+    keyword_strength_entries=keyword_entries,
+    embedding_reference_count=len(references),
+    orphan_embedding_count=orphan_count,
+    nonempty_vector_count=len(nonempty_vectors),
+    observed_dimensions=observed_dimensions,
+    internal_mismatch=internal_mismatch,
+  )
+
+
+def prepare_isolated_embedding_stores(fixture,
+                                      persona_names=ISOLATED_FIXTURE_PERSONAS):
+  """Audit all required stores, then modernize only proven-empty copies."""
+  if not isinstance(fixture, IsolatedReverieFixture):
+    raise TypeError("fixture must be IsolatedReverieFixture")
+  if tuple(persona_names) != ISOLATED_FIXTURE_PERSONAS:
+    raise IsolatedEmbeddingPreflightError(
+      "PERSONA_SET_MISMATCH", "required Persona set does not match")
+
+  audits_before = tuple(inspect_isolated_embedding_store(
+    persona_name,
+    fixture.personas_dir / persona_name / "bootstrap_memory"
+    / "associative_memory",
+    fixture.simulation_root,
+  ) for persona_name in persona_names)
+  blocked = tuple(audit for audit in audits_before if audit.classification in (
+    LEGACY_NONEMPTY_BLOCKED, INCONSISTENT_BLOCKED, UNKNOWN_BLOCKED))
+  if blocked:
+    if any(audit.classification == INCONSISTENT_BLOCKED for audit in blocked):
+      reason_code = "EMBEDDING_FIXTURE_INCONSISTENT"
+    elif any(audit.classification == LEGACY_NONEMPTY_BLOCKED
+             for audit in blocked):
+      reason_code = "EMBEDDING_STORE_MIGRATION_REQUIRED"
+    else:
+      reason_code = "EMBEDDING_STORE_UNKNOWN"
+    raise IsolatedEmbeddingPreflightError(
+      reason_code, "one or more required embedding stores are blocked",
+      audits_before)
+
+  bootstrapped = []
+  for audit in audits_before:
+    if audit.classification != EMPTY_BOOTSTRAPPABLE:
+      continue
+    store_path = audit.store_path
+    backup_path = store_path.with_name(
+      ".associative_memory.r1t_empty_backup")
+    if backup_path.exists():
+      raise IsolatedEmbeddingPreflightError(
+        "EMBEDDING_BOOTSTRAP_BACKUP_EXISTS",
+        "temporary embedding bootstrap backup already exists", audits_before)
+    store_path.rename(backup_path)
+    try:
+      bootstrap_modern_embedding_store(
+        ModernEmbeddingStoreBootstrapRequest(
+          target_path=store_path, allowed_parent=store_path.parent))
+    except Exception as error:
+      if store_path.exists():
+        shutil.rmtree(store_path)
+      backup_path.rename(store_path)
+      raise IsolatedEmbeddingPreflightError(
+        "EMBEDDING_BOOTSTRAP_FAILED",
+        "empty isolated embedding store bootstrap failed",
+        audits_before) from error
+    shutil.rmtree(backup_path)
+    bootstrapped.append(audit.persona_name)
+
+  audits_after = tuple(inspect_isolated_embedding_store(
+    persona_name,
+    fixture.personas_dir / persona_name / "bootstrap_memory"
+    / "associative_memory",
+    fixture.simulation_root,
+  ) for persona_name in persona_names)
+  if any(audit.classification != MODERN_COMPATIBLE
+         for audit in audits_after):
+    raise IsolatedEmbeddingPreflightError(
+      "EMBEDDING_BOOTSTRAP_VERIFICATION_FAILED",
+      "modernized embedding stores failed final verification", audits_after)
+  return IsolatedEmbeddingPreflightResult(
+    audits_before=audits_before,
+    audits_after=audits_after,
+    bootstrapped_personas=tuple(bootstrapped),
+  )
+
+
+def _sanitized_traceback_path(filename, repository_root, temporary_root):
+  path = Path(filename).resolve()
+  repository_root = Path(repository_root).resolve()
+  temporary_root = Path(temporary_root).resolve()
+  if _path_is_within(path, repository_root):
+    return path.relative_to(repository_root).as_posix()
+  if _path_is_within(path, temporary_root):
+    return "<temporary>/" + path.relative_to(temporary_root).as_posix()
+  return "<external>/" + path.name
+
+
+def _safe_ast_value(node, frame):
+  if isinstance(node, ast.Name):
+    return frame.f_locals.get(node.id), node.id
+  if isinstance(node, ast.Attribute):
+    parent, origin = _safe_ast_value(node.value, frame)
+    if parent is None or origin is None or node.attr.startswith("_"):
+      return None, None
+    try:
+      return getattr(parent, node.attr), f"{origin}.{node.attr}"
+    except Exception:
+      return None, None
+  return None, None
+
+
+def _safe_ast_index(node, frame):
+  if isinstance(node, ast.Constant) and type(node.value) is int:
+    return node.value
+  if (isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub)
+      and isinstance(node.operand, ast.Constant)
+      and type(node.operand.value) is int):
+    return -node.operand.value
+  if isinstance(node, ast.Name):
+    value = frame.f_locals.get(node.id)
+    return value if type(value) is int else None
+  return None
+
+
+def _collection_diagnostic_from_traceback(error):
+  traceback_node = error.__traceback__
+  if traceback_node is None:
+    return None
+  while traceback_node.tb_next is not None:
+    traceback_node = traceback_node.tb_next
+  frame = traceback_node.tb_frame
+  filename = Path(frame.f_code.co_filename)
+  try:
+    tree = ast.parse(filename.read_text(encoding="utf-8"))
+  except (OSError, UnicodeError, SyntaxError):
+    return None
+  line = traceback_node.tb_lineno
+  candidates = [node for node in ast.walk(tree)
+                if isinstance(node, ast.Subscript)
+                and node.lineno <= line <= getattr(node, "end_lineno", line)]
+  for node in candidates:
+    collection, origin = _safe_ast_value(node.value, frame)
+    requested_index = _safe_ast_index(node.slice, frame)
+    if origin is None or requested_index is None:
+      continue
+    try:
+      length = len(collection)
+    except (TypeError, ValueError):
+      continue
+    out_of_range = (
+      requested_index >= length or requested_index < -length
+      if length else True)
+    if not out_of_range:
+      continue
+    try:
+      element_types = tuple(sorted({type(item).__name__
+                                    for item in collection}))
+    except TypeError:
+      element_types = ()
+    return {
+      "type": type(collection).__name__,
+      "length": length,
+      "requested_index": requested_index,
+      "empty": length == 0,
+      "element_type_names": element_types,
+      "source": origin,
+    }
+  return None
+
+
+def build_sanitized_failure_evidence(
+    error, repository_root, temporary_root, phase, current_module,
+    telemetry, call_guard, cost_guard, provider_call_count,
+    network_call_count, current_caller=None):
+  """Capture content-free diagnostics while replay contexts are still live."""
+  if not isinstance(error, BaseException):
+    raise TypeError("error must be an exception")
+  events = tuple(telemetry)
+  frames = []
+  traceback_node = error.__traceback__
+  while traceback_node is not None:
+    frame = traceback_node.tb_frame
+    frames.append({
+      "file": _sanitized_traceback_path(
+        frame.f_code.co_filename, repository_root, temporary_root),
+      "function": frame.f_code.co_name,
+      "line": traceback_node.tb_lineno,
+    })
+    traceback_node = traceback_node.tb_next
+  last_event = events[-1] if events else None
+  successful = [event for event in events
+                if getattr(event, "outcome", None) == "SUCCESS"]
+  last_completed = successful[-1] if successful else None
+  caller_counts = Counter(
+    getattr(event, "caller_id", None) or "unattributed" for event in events)
+  operation_counts = Counter(
+    getattr(event, "operation", "UNKNOWN") for event in events)
+  cost_snapshot = cost_guard.snapshot()
+  ledger_records = cost_guard.records()
+  forbidden = frozenset(FORBIDDEN_MODERN_RUNTIME_MODELS)
+  legacy_detections = sum(
+    getattr(event, "model_or_engine", None) in forbidden
+    or getattr(event, "response_model", None) in forbidden
+    for event in events)
+  parser_frames = tuple(frame["function"] for frame in frames if any(
+    token in frame["function"].lower()
+    for token in ("parser", "clean", "validate", "run_gpt_prompt")))
+  collection = (_collection_diagnostic_from_traceback(error)
+                if isinstance(error, IndexError) else None)
+
+  last_telemetry = None
+  if last_event is not None:
+    last_telemetry = {
+      "caller_id": getattr(last_event, "caller_id", None),
+      "operation": getattr(last_event, "operation", None),
+      "outcome": getattr(last_event, "outcome", None),
+      "requested_model": getattr(last_event, "model_or_engine", None),
+      "returned_model": getattr(last_event, "response_model", None),
+      "physical_attempt": getattr(last_event, "physical_attempt", None),
+      "error_type": getattr(last_event, "error_type", None),
+    }
+  return {
+    "reason_code": "PLAN_INDEX_ERROR" if isinstance(error, IndexError)
+                   else "COGNITIVE_FAILURE",
+    "exception_type": type(error).__name__,
+    "traceback": tuple(frames),
+    "failure_phase": phase,
+    "current_module": current_module,
+    "current_caller": current_caller or (
+      getattr(last_event, "caller_id", None) if last_event else None),
+    "last_completed_caller": (
+      getattr(last_completed, "caller_id", None) if last_completed else None),
+    "operation": getattr(last_event, "operation", None) if last_event else None,
+    "parser_frames": parser_frames,
+    "fallback_used": None,
+    "collection": collection,
+    "logical_calls": call_guard.logical_calls,
+    "physical_attempts": call_guard.physical_attempts,
+    "retry_count": max(
+      0, call_guard.physical_attempts - call_guard.logical_calls),
+    "operation_breakdown": tuple(sorted(operation_counts.items())),
+    "caller_breakdown": tuple(sorted(caller_counts.items())),
+    "telemetry_events": len(events),
+    "last_telemetry": last_telemetry,
+    "ledger_records": len(ledger_records),
+    "cost": {
+      "accumulated": str(cost_snapshot.accumulated_cost),
+      "ceiling": str(cost_snapshot.ceiling),
+      "remaining": str(cost_snapshot.remaining_cost),
+      "tripped": cost_snapshot.tripped,
+      "logical_calls": cost_snapshot.logical_calls,
+      "physical_attempts": cost_snapshot.physical_attempts,
+      "by_operation": tuple(
+        (name, str(value)) for name, value in cost_snapshot.cost_by_operation),
+    },
+    "legacy_detections": legacy_detections,
+    "provider_calls": provider_call_count,
+    "network_calls": network_call_count,
+  }
 
 
 class ReplayLogicalCallLimitExceededError(ReplayCostGuardError):
@@ -308,6 +892,66 @@ class DeterministicReplayFakeAdapter:
       vector=(1.0,) + (0.0,) * 1535,
       model=kwargs["model"],
       request_id=f"r0h-embedding-{len(self.calls)}",
+      usage=NormalizedUsage(self.embedding_input_tokens, None),
+    )
+
+
+R1T_GENERIC_FAKE_RESPONSE = "7 am"
+R1T_PRONUNCIATIO_FAKE_RESPONSE = "🙂🙂"
+R1T_ACT_OBJ_DESC_FAKE_RESPONSE = "state"
+R1T_TASK_DECOMP_FAKE_RESPONSE = (
+  "preparing for the activity (duration in minutes: 5, minutes left: 0)")
+
+
+class R1TDeterministicFakeAdapter(DeterministicReplayFakeAdapter):
+  """Caller-aware offline matrix used by the isolated full-tick fixture."""
+
+  def __init__(self, *, input_tokens=20, output_tokens=3,
+               embedding_input_tokens=1):
+    super().__init__(
+      text_responses=(), input_tokens=input_tokens,
+      output_tokens=output_tokens,
+      embedding_input_tokens=embedding_input_tokens)
+    self.calls = []
+
+  @staticmethod
+  def response_for_caller(caller_id):
+    if caller_id == "task_decomp":
+      return R1T_TASK_DECOMP_FAKE_RESPONSE
+    if caller_id == "pronunciatio":
+      return R1T_PRONUNCIATIO_FAKE_RESPONSE
+    if caller_id == "act_obj_desc":
+      return R1T_ACT_OBJ_DESC_FAKE_RESPONSE
+    return R1T_GENERIC_FAKE_RESPONSE
+
+  def create_chat(self, **kwargs):
+    caller_id = get_llm_replay_context().caller_id
+    response = self.response_for_caller(caller_id)
+    self.calls.append({
+      "method": "create_chat", "caller_id": caller_id,
+      "model": kwargs["model"],
+    })
+    return NormalizedTextResponse(
+      text=response,
+      model=kwargs["model"],
+      request_id=f"r1t-text-{len(self.calls)}",
+      finish_reason="stop",
+      status="completed",
+      usage=NormalizedUsage(
+        self.input_tokens, self.output_tokens,
+        self.cached_input_tokens, self.reasoning_tokens),
+    )
+
+  def create_embedding(self, **kwargs):
+    caller_id = get_llm_replay_context().caller_id
+    self.calls.append({
+      "method": "create_embedding", "caller_id": caller_id,
+      "model": kwargs["model"],
+    })
+    return NormalizedEmbeddingResponse(
+      vector=(1.0,) + (0.0,) * 1535,
+      model=kwargs["model"],
+      request_id=f"r1t-embedding-{len(self.calls)}",
       usage=NormalizedUsage(self.embedding_input_tokens, None),
     )
 

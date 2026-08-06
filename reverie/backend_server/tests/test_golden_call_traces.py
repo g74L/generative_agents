@@ -19,6 +19,10 @@ if str(TESTS_DIR) not in sys.path:
 from golden_trace import build_golden_trace
 from persona.cognitive_modules import converse, retrieve
 from persona.prompt_template import gpt_structure, run_gpt_prompt
+from persona.prompt_template.chat_runtime import (
+  M5_CHAT_MODEL, build_modern_chat_runtime_config,
+  use_modern_chat_runtime,
+)
 from persona.prompt_template.llm_provider import (
   CHAT,
   COMPLETION,
@@ -38,6 +42,23 @@ from persona.prompt_template.llm_provider import (
   set_embedding_cache_enabled,
   use_provider,
 )
+from persona.prompt_template.modern_openai_provider import (
+  NormalizedTextResponse, NormalizedUsage,
+)
+
+
+class _ModernChatAdapter:
+  def __init__(self, *contents):
+    self.contents = list(contents)
+    self.calls = []
+
+  def create_chat(self, **kwargs):
+    self.calls.append(kwargs)
+    content = self.contents.pop(0)
+    return NormalizedTextResponse(
+      text=content, model=M5_CHAT_MODEL, request_id="req-golden-chat",
+      finish_reason="stop", status="completed",
+      usage=NormalizedUsage(20, 8, 0, 0))
 
 
 def _scratch(name, action):
@@ -236,33 +257,34 @@ class GoldenCallTraceTests(unittest.TestCase):
     self.assertEqual(1, stats.cache_hits)
     self.assertEqual(3, stats.cache_misses)
 
-  def test_golden_importance_poignancy_parsing_and_legacy_failure(self):
+  def test_golden_importance_poignancy_parsing_and_modern_failure(self):
     persona = SimpleNamespace(scratch=_scratch("Alice", "reading"))
-    self.fake.queue_chat_response('{"output": "7"}')
+    adapter = _ModernChatAdapter('{"output": "7"}')
 
-    with redirect_stdout(io.StringIO()):
+    with redirect_stdout(io.StringIO()), use_modern_chat_runtime(
+        build_modern_chat_runtime_config(), adapter):
       output, metadata = run_gpt_prompt.run_gpt_prompt_event_poignancy(
         persona, "Alice reads a letter")
 
     self.assertEqual(7, output)
     self.assertEqual(4, metadata[-1])
-    self.assertEqual(CHAT, self.trace()[0]["operation"])
-    self.assertEqual("gpt-3.5-turbo", self.trace()[0]["model"])
+    self.assertEqual(CHAT, get_telemetry()[0].operation)
+    self.assertEqual(M5_CHAT_MODEL, get_telemetry()[0].model_or_engine)
 
     clear_telemetry()
-    self.fake.calls.clear()
-    for invalid in ("invalid", "still invalid", "not numeric"):
-      self.fake.queue_chat_response(invalid)
-    with redirect_stdout(io.StringIO()):
+    adapter = _ModernChatAdapter("invalid", "still invalid", "not numeric")
+    with redirect_stdout(io.StringIO()), use_modern_chat_runtime(
+        build_modern_chat_runtime_config(), adapter):
       failed_output = run_gpt_prompt.run_gpt_prompt_event_poignancy(
         persona, "Alice reads a letter")
 
     self.assertIsNone(failed_output)
-    failure_trace = self.trace()
-    self.assertEqual(1, len(failure_trace))
-    self.assertEqual(3, failure_trace[0]["physical_attempts"])
+    failure_events = get_telemetry()
+    self.assertEqual(3, len(failure_events))
+    self.assertEqual(1, len({event.logical_call_id
+                            for event in failure_events}))
     self.assertEqual([SUCCESS, SUCCESS, SUCCESS],
-                     failure_trace[0]["outcomes"])
+                     [event.outcome for event in failure_events])
 
   def test_golden_event_triple_wrapper_parsing(self):
     persona = SimpleNamespace(name="Alice")

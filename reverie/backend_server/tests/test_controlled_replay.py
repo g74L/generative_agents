@@ -3,47 +3,75 @@ import datetime
 from decimal import Decimal
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
 import socket
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 BACKEND_SERVER = Path(__file__).resolve().parents[1]
 REPOSITORY = BACKEND_SERVER.parents[1]
+VERSIONED_BASELINE = (
+  REPOSITORY / "environment" / "frontend_server" / "storage"
+  / "base_the_ville_isabella_maria_klaus")
 if str(BACKEND_SERVER) not in sys.path:
   sys.path.insert(0, str(BACKEND_SERVER))
 
+import controlled_replay as controlled_replay_module
 from controlled_replay import (
+  EMPTY_BOOTSTRAPPABLE,
+  INCONSISTENT_BLOCKED,
+  LEGACY_NONEMPTY_BLOCKED,
+  MODERN_COMPATIBLE,
+  UNKNOWN_BLOCKED,
   ControlledReplayActorFixture,
   ControlledReplayConfigurationError,
   ControlledReplayEnvironmentFixture,
+  IsolatedFixturePreflightError,
+  IsolatedEmbeddingPreflightError,
   ControlledReplayLegacyConfigurationError,
   ControlledReplayPathForbiddenError,
   ControlledReplayProfile,
   ControlledReplayProviders,
   DeterministicReplayFakeAdapter,
+  R1TDeterministicFakeAdapter,
+  R1T_ACT_OBJ_DESC_FAKE_RESPONSE,
+  R1T_GENERIC_FAKE_RESPONSE,
+  R1T_PRONUNCIATIO_FAKE_RESPONSE,
+  R1T_TASK_DECOMP_FAKE_RESPONSE,
+  _historical_wrapper_environment,
   ReplayCallCountGuardState,
   ReplayLogicalCallLimitExceededError,
   ReplayPhysicalAttemptLimitExceededError,
   assert_controlled_replay_path_allowed,
   build_controlled_replay_actor_fixture,
   controlled_replay_contexts_are_reset,
+  build_sanitized_failure_evidence,
+  inspect_isolated_embedding_store,
+  prepare_isolated_embedding_stores,
+  prepare_isolated_reverie_fixture,
   run_controlled_replay_step,
 )
 from persona.memory_structures.embedding_space import (
   EMBEDDING_MANIFEST_FILENAME,
   LEGACY_ADA_002_MANIFEST,
   get_runtime_embedding_manifest,
+  load_embedding_store,
+  read_embedding_manifest,
 )
 from persona.memory_structures.scratch import Scratch
 from persona.prompt_template import gpt_structure
 from persona.prompt_template import run_gpt_prompt
 from persona.prompt_template.chat_runtime import (
   ModernChatRuntimeConfig,
+  build_modern_chat_runtime_config,
   get_modern_chat_runtime_config,
+  use_modern_chat_runtime,
 )
 from persona.prompt_template.completion_runtime import (
   CompletionCompatCallerNotAllowedError,
@@ -55,7 +83,10 @@ from persona.prompt_template.completion_runtime import (
   use_modern_completion_runtime,
 )
 from persona.prompt_template.embedding_runtime import (
+  TEXT_EMBEDDING_3_SMALL_1536_MANIFEST,
   build_legacy_embedding_runtime_config,
+  build_modern_embedding_runtime_config,
+  use_embedding_runtime,
 )
 from persona.prompt_template.cost_ledger import PricingSnapshot
 from persona.prompt_template.embedding_store_bootstrap import (
@@ -72,6 +103,7 @@ from persona.prompt_template.llm_provider import (
   get_telemetry,
   reset_embedding_measurement_all,
   reset_provider,
+  use_llm_replay_context,
 )
 from persona.prompt_template.llm_provider_config import (
   LLMProviderConfig,
@@ -93,6 +125,657 @@ from persona.prompt_template.replay_cost_guard import (
   ReplayCostCeilingExceededError,
   get_replay_cost_guard,
 )
+
+
+def _raise_sanitized_index_error():
+  values = []
+  prompt = "PRIVATE-PROMPT-MARKER"
+  response = "PRIVATE-RESPONSE-MARKER"
+  if prompt and response:
+    return values[2]
+
+
+class IsolatedFixturePreflightTests(unittest.TestCase):
+  def setUp(self):
+    self.temporary = tempfile.TemporaryDirectory()
+    self.root = Path(self.temporary.name)
+    self.baseline = self.root / "baseline"
+    self.baseline.mkdir()
+    (self.baseline / "environment").mkdir()
+    (self.baseline / "environment" / "0.json").write_text(
+      "{}", encoding="utf-8")
+    (self.baseline / "personas").mkdir()
+    (self.baseline / "reverie").mkdir()
+    self.isolated_parent = self.root / "isolated"
+    self.isolated_parent.mkdir()
+
+  def tearDown(self):
+    self.temporary.cleanup()
+
+  def copy_fixture(self, name="simulation"):
+    target = self.isolated_parent / name
+    shutil.copytree(self.baseline, target)
+    return target
+
+  def prepare(self, target, **changes):
+    values = {
+      "simulation_root": target,
+      "temporary_root": self.isolated_parent,
+      "baseline_root": self.baseline,
+      "source_step": 0,
+    }
+    values.update(changes)
+    return prepare_isolated_reverie_fixture(**values)
+
+  def test_01_creates_contained_movement_without_mutating_baseline(self):
+    baseline_entries = sorted(
+      path.relative_to(self.baseline).as_posix()
+      for path in self.baseline.rglob("*"))
+    target = self.copy_fixture()
+
+    fixture = self.prepare(target)
+
+    self.assertTrue(fixture.movement_dir.is_dir())
+    self.assertIn(fixture.simulation_root, fixture.movement_dir.parents)
+    self.assertFalse((self.baseline / "movement").exists())
+    self.assertEqual(baseline_entries, sorted(
+      path.relative_to(self.baseline).as_posix()
+      for path in self.baseline.rglob("*")))
+
+  def test_02_preflight_is_idempotent(self):
+    target = self.copy_fixture()
+    first = self.prepare(target)
+    marker = first.movement_dir / "existing.json"
+    marker.write_text("{}", encoding="utf-8")
+
+    second = self.prepare(target)
+
+    self.assertEqual(first, second)
+    self.assertTrue(marker.is_file())
+
+  def test_03_missing_required_directories_fail_before_movement_creation(self):
+    cases = (
+      ("environment", "ENVIRONMENT_DIR_MISSING"),
+      ("personas", "PERSONAS_DIR_MISSING"),
+      ("reverie", "REVERIE_DIR_MISSING"),
+    )
+    for index, (directory, reason_code) in enumerate(cases):
+      with self.subTest(directory=directory):
+        target = self.copy_fixture(f"missing-{index}")
+        shutil.rmtree(target / directory)
+        with self.assertRaises(IsolatedFixturePreflightError) as raised:
+          self.prepare(target)
+        self.assertEqual(reason_code, raised.exception.reason_code)
+        self.assertFalse((target / "movement").exists())
+
+  def test_04_missing_source_environment_step_fails_before_mutation(self):
+    target = self.copy_fixture()
+    (target / "environment" / "0.json").unlink()
+
+    with self.assertRaises(IsolatedFixturePreflightError) as raised:
+      self.prepare(target)
+
+    self.assertEqual("SOURCE_ENVIRONMENT_STEP_MISSING",
+                     raised.exception.reason_code)
+    self.assertFalse((target / "movement").exists())
+
+  def test_05_external_movement_target_is_rejected(self):
+    target = self.copy_fixture()
+    external = self.root / "external-movement"
+
+    with self.assertRaises(IsolatedFixturePreflightError) as raised:
+      self.prepare(target, movement_dir=external)
+
+    self.assertEqual("FIXTURE_PATH_OUTSIDE_SIMULATION",
+                     raised.exception.reason_code)
+    self.assertFalse(external.exists())
+
+  def test_06_protected_repository_storage_is_rejected_as_output(self):
+    protected_storage = (
+      REPOSITORY / "environment" / "frontend_server" / "storage")
+    existing_simulations = [path for path in protected_storage.iterdir()
+                            if path.is_dir()]
+    self.assertTrue(existing_simulations)
+
+    with self.assertRaises(IsolatedFixturePreflightError) as raised:
+      prepare_isolated_reverie_fixture(
+        simulation_root=existing_simulations[0],
+        temporary_root=protected_storage,
+        baseline_root=REPOSITORY,
+        source_step=0,
+      )
+
+    self.assertEqual("PROTECTED_STORAGE_TARGET", raised.exception.reason_code)
+
+  def test_07_path_traversal_outside_temporary_root_is_rejected(self):
+    outside = self.root / "outside"
+    shutil.copytree(self.baseline, outside)
+    traversing = self.isolated_parent / ".." / "outside"
+
+    with self.assertRaises(IsolatedFixturePreflightError) as raised:
+      self.prepare(traversing)
+
+    self.assertEqual("SIMULATION_OUTSIDE_TEMPORARY_ROOT",
+                     raised.exception.reason_code)
+    self.assertFalse((outside / "movement").exists())
+
+  def test_08_structural_failure_precedes_provider_and_persona_move(self):
+    target = self.copy_fixture()
+    shutil.rmtree(target / "personas")
+
+    with patch("persona.persona.Persona.move") as move, patch.object(
+        ModernOpenAIClientAdapter, "create_chat") as provider:
+      with self.assertRaises(IsolatedFixturePreflightError):
+        self.prepare(target)
+
+    move.assert_not_called()
+    provider.assert_not_called()
+    self.assertFalse((target / "movement").exists())
+
+  def test_09_valid_fixture_passes_all_structural_checks(self):
+    target = self.copy_fixture()
+
+    fixture = self.prepare(target)
+
+    self.assertEqual((target / "environment" / "0.json").resolve(),
+                     fixture.environment_step_path)
+    self.assertEqual((target / "personas").resolve(), fixture.personas_dir)
+    self.assertEqual((target / "reverie").resolve(), fixture.reverie_dir)
+    self.assertTrue(os.access(fixture.movement_dir, os.W_OK))
+
+  def test_10_real_baseline_copy_is_prepared_byte_for_byte_safely(self):
+    real_baseline = VERSIONED_BASELINE
+    before = {
+      path.relative_to(real_baseline).as_posix(): hashlib.sha256(
+        path.read_bytes()).hexdigest()
+      for path in real_baseline.rglob("*") if path.is_file()
+    }
+    self.assertFalse((real_baseline / "movement").exists())
+    target = self.isolated_parent / "real-baseline-copy"
+    shutil.copytree(real_baseline, target)
+
+    fixture = prepare_isolated_reverie_fixture(
+      simulation_root=target,
+      temporary_root=self.isolated_parent,
+      baseline_root=real_baseline,
+      source_step=0,
+    )
+
+    after = {
+      path.relative_to(real_baseline).as_posix(): hashlib.sha256(
+        path.read_bytes()).hexdigest()
+      for path in real_baseline.rglob("*") if path.is_file()
+    }
+    self.assertTrue(fixture.movement_dir.is_dir())
+    self.assertFalse((real_baseline / "movement").exists())
+    self.assertEqual(before, after)
+
+
+class IsolatedEmbeddingPreflightTests(unittest.TestCase):
+  PERSONAS = ("Isabella Rodriguez", "Maria Lopez", "Klaus Mueller")
+
+  def setUp(self):
+    self.temporary = tempfile.TemporaryDirectory()
+    self.root = Path(self.temporary.name)
+    self.baseline = self.root / "baseline"
+    self.baseline.mkdir()
+    (self.baseline / "environment").mkdir()
+    (self.baseline / "environment" / "0.json").write_text(
+      "{}", encoding="utf-8")
+    (self.baseline / "personas").mkdir()
+    (self.baseline / "reverie").mkdir()
+    for persona_name in self.PERSONAS:
+      store = (self.baseline / "personas" / persona_name
+               / "bootstrap_memory" / "associative_memory")
+      store.mkdir(parents=True)
+      self.write_store(store)
+    self.isolated = self.root / "isolated"
+    shutil.copytree(self.baseline, self.isolated)
+    self.fixture = prepare_isolated_reverie_fixture(
+      simulation_root=self.isolated,
+      temporary_root=self.root,
+      baseline_root=self.baseline,
+      source_step=0,
+    )
+
+  def tearDown(self):
+    self.temporary.cleanup()
+
+  def write_store(self, store, embeddings=None, nodes=None, manifest=None,
+                  keyword_strength=None):
+    embeddings = {} if embeddings is None else embeddings
+    nodes = {} if nodes is None else nodes
+    keyword_strength = keyword_strength or {
+      "kw_strength_event": {}, "kw_strength_thought": {}}
+    (store / "embeddings.json").write_text(
+      json.dumps(embeddings), encoding="utf-8")
+    (store / "nodes.json").write_text(
+      json.dumps(nodes), encoding="utf-8")
+    (store / "kw_strength.json").write_text(
+      json.dumps(keyword_strength), encoding="utf-8")
+    manifest_path = store / EMBEDDING_MANIFEST_FILENAME
+    if manifest is None:
+      if manifest_path.exists():
+        manifest_path.unlink()
+    else:
+      manifest_path.write_text(
+        json.dumps(manifest.to_dict()), encoding="utf-8")
+
+  def store(self, persona_name, root=None):
+    root = root or self.isolated
+    return (root / "personas" / persona_name / "bootstrap_memory"
+            / "associative_memory")
+
+  def node(self, embedding_key="key"):
+    return {
+      "node_count": 1, "type_count": 1, "type": "event", "depth": 0,
+      "created": "2023-02-13 00:00:00", "expiration": None,
+      "subject": "subject", "predicate": "is", "object": "idle",
+      "description": "description", "embedding_key": embedding_key,
+      "poignancy": 1, "keywords": [], "filling": [],
+    }
+
+  def audit(self, persona_name="Isabella Rodriguez"):
+    return inspect_isolated_embedding_store(
+      persona_name, self.store(persona_name), self.isolated)
+
+  def test_01_empty_legacy_store_is_bootstrappable_with_structural_metadata(self):
+    audit = self.audit()
+
+    self.assertEqual(EMPTY_BOOTSTRAPPABLE, audit.classification)
+    self.assertEqual("LEGACY_ASSUMED", audit.source_classification)
+    self.assertFalse(audit.manifest_present)
+    self.assertEqual(LEGACY_ADA_002_MANIFEST.model, audit.model)
+    self.assertEqual((0, 0, 0, 0, 0), (
+      audit.embedding_count, audit.node_count,
+      audit.embedding_reference_count, audit.orphan_embedding_count,
+      audit.nonempty_vector_count))
+    self.assertEqual((), audit.observed_dimensions)
+    self.assertFalse(audit.internal_mismatch)
+
+  def test_02_empty_stores_use_canonical_bootstrap_and_become_loadable(self):
+    original = controlled_replay_module.bootstrap_modern_embedding_store
+    with patch.object(
+        controlled_replay_module, "bootstrap_modern_embedding_store",
+        wraps=original) as bootstrap:
+      result = prepare_isolated_embedding_stores(self.fixture)
+
+    self.assertEqual(3, bootstrap.call_count)
+    self.assertEqual(self.PERSONAS, result.bootstrapped_personas)
+    self.assertTrue(all(a.classification == MODERN_COMPATIBLE
+                        for a in result.audits_after))
+    for persona_name in self.PERSONAS:
+      store = self.store(persona_name)
+      manifest = read_embedding_manifest(
+        store / EMBEDDING_MANIFEST_FILENAME)
+      self.assertEqual(TEXT_EMBEDDING_3_SMALL_1536_MANIFEST, manifest)
+      loaded = load_embedding_store(
+        store, legacy_assumption_allowed=False,
+        runtime_manifest=TEXT_EMBEDDING_3_SMALL_1536_MANIFEST)
+      self.assertEqual({}, loaded.embeddings)
+      self.assertEqual({}, loaded.nodes)
+
+  def test_03_nonempty_legacy_embedding_blocks_without_relabeling(self):
+    store = self.store("Isabella Rodriguez")
+    vector = [1.0] + [0.0] * 1535
+    node = self.node()
+    self.write_store(store, {"key": vector}, {"node_1": node})
+    before = snapshot = {
+      path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+      for path in store.iterdir() if path.is_file()}
+
+    audit = self.audit()
+    with self.assertRaises(IsolatedEmbeddingPreflightError) as raised:
+      prepare_isolated_embedding_stores(self.fixture)
+
+    self.assertEqual(LEGACY_NONEMPTY_BLOCKED, audit.classification)
+    self.assertEqual("EMBEDDING_STORE_MIGRATION_REQUIRED",
+                     raised.exception.reason_code)
+    self.assertFalse((store / EMBEDDING_MANIFEST_FILENAME).exists())
+    self.assertEqual(snapshot, {
+      path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+      for path in store.iterdir() if path.is_file()})
+
+  def test_04_declared_ada_nonempty_manifest_is_never_rewritten(self):
+    store = self.store("Isabella Rodriguez")
+    vector = [1.0] + [0.0] * 1535
+    self.write_store(
+      store, {"key": vector}, {"node_1": self.node()},
+      LEGACY_ADA_002_MANIFEST)
+    manifest_before = (store / EMBEDDING_MANIFEST_FILENAME).read_bytes()
+
+    with self.assertRaises(IsolatedEmbeddingPreflightError):
+      prepare_isolated_embedding_stores(self.fixture)
+
+    self.assertEqual(
+      manifest_before, (store / EMBEDDING_MANIFEST_FILENAME).read_bytes())
+    self.assertEqual(LEGACY_ADA_002_MANIFEST, read_embedding_manifest(
+      store / EMBEDDING_MANIFEST_FILENAME))
+
+  def test_05_missing_embedding_reference_is_inconsistent(self):
+    store = self.store("Isabella Rodriguez")
+    self.write_store(store, {}, {"node_1": {"embedding_key": "missing"}})
+
+    audit = self.audit()
+    with self.assertRaises(IsolatedEmbeddingPreflightError) as raised:
+      prepare_isolated_embedding_stores(self.fixture)
+
+    self.assertEqual(INCONSISTENT_BLOCKED, audit.classification)
+    self.assertEqual("EMBEDDING_FIXTURE_INCONSISTENT",
+                     raised.exception.reason_code)
+    self.assertTrue(audit.internal_mismatch)
+
+  def test_06_unknown_store_fails_closed(self):
+    store = self.store("Isabella Rodriguez")
+    (store / "kw_strength.json").unlink()
+
+    audit = self.audit()
+
+    self.assertEqual(UNKNOWN_BLOCKED, audit.classification)
+    with self.assertRaises(IsolatedEmbeddingPreflightError) as raised:
+      prepare_isolated_embedding_stores(self.fixture)
+    self.assertEqual("EMBEDDING_STORE_UNKNOWN", raised.exception.reason_code)
+
+  def test_07_all_personas_are_audited_before_constructor_provider_or_move(self):
+    blocked_store = self.store("Klaus Mueller")
+    vector = [1.0] + [0.0] * 1535
+    self.write_store(
+      blocked_store, {"key": vector}, {"node_1": self.node()})
+    first_store = self.store("Isabella Rodriguez")
+    first_before = {path.name: path.read_bytes() for path in first_store.iterdir()}
+    constructor = Mock()
+
+    def construct_only_after_preflight():
+      prepare_isolated_embedding_stores(self.fixture)
+      constructor()
+
+    with patch("persona.persona.Persona.move") as move, patch.object(
+          ModernOpenAIClientAdapter, "create_chat") as provider:
+      with self.assertRaises(IsolatedEmbeddingPreflightError) as raised:
+        construct_only_after_preflight()
+
+    self.assertEqual(3, len(raised.exception.audits))
+    constructor.assert_not_called()
+    move.assert_not_called()
+    provider.assert_not_called()
+    self.assertEqual(first_before, {
+      path.name: path.read_bytes() for path in first_store.iterdir()})
+
+  def test_08_modernization_is_contained_and_idempotent(self):
+    first = prepare_isolated_embedding_stores(self.fixture)
+    first_snapshot = {
+      path.relative_to(self.isolated).as_posix(): path.read_bytes()
+      for path in self.isolated.rglob("*") if path.is_file()}
+
+    second = prepare_isolated_embedding_stores(self.fixture)
+
+    self.assertEqual((), second.bootstrapped_personas)
+    self.assertEqual(first_snapshot, {
+      path.relative_to(self.isolated).as_posix(): path.read_bytes()
+      for path in self.isolated.rglob("*") if path.is_file()})
+    self.assertTrue(all(self.isolated in audit.store_path.parents
+                        for audit in first.audits_after))
+    self.assertFalse(any(path.name.endswith("r1t_empty_backup")
+                         for path in self.root.rglob("*")))
+
+  def test_09_real_baseline_is_unchanged_by_copy_modernization(self):
+    real_baseline = VERSIONED_BASELINE
+    before = {
+      path.relative_to(real_baseline).as_posix(): path.read_bytes()
+      for path in real_baseline.rglob("*") if path.is_file()}
+    real_copy = self.root / "real-copy"
+    shutil.copytree(real_baseline, real_copy)
+    fixture = prepare_isolated_reverie_fixture(
+      real_copy, self.root, real_baseline, 0)
+
+    result = prepare_isolated_embedding_stores(fixture)
+
+    self.assertTrue(all(a.classification == EMPTY_BOOTSTRAPPABLE
+                        for a in result.audits_before))
+    self.assertEqual(before, {
+      path.relative_to(real_baseline).as_posix(): path.read_bytes()
+      for path in real_baseline.rglob("*") if path.is_file()})
+
+  def test_10_existing_empty_modern_store_is_compatible_without_mutation(self):
+    for persona_name in self.PERSONAS:
+      self.write_store(
+        self.store(persona_name), manifest=TEXT_EMBEDDING_3_SMALL_1536_MANIFEST)
+    before = {path.relative_to(self.isolated).as_posix(): path.read_bytes()
+              for path in self.isolated.rglob("*") if path.is_file()}
+
+    result = prepare_isolated_embedding_stores(self.fixture)
+
+    self.assertEqual((), result.bootstrapped_personas)
+    self.assertTrue(all(a.classification == MODERN_COMPATIBLE
+                        for a in result.audits_before))
+    self.assertEqual(before, {
+      path.relative_to(self.isolated).as_posix(): path.read_bytes()
+      for path in self.isolated.rglob("*") if path.is_file()})
+
+
+class SanitizedFailureEvidenceTests(unittest.TestCase):
+  def setUp(self):
+    self.temporary = tempfile.TemporaryDirectory()
+    self.temp_root = Path(self.temporary.name)
+    self.event = SimpleNamespace(
+      caller_id="act_obj_desc", operation="CHAT", outcome="SUCCESS",
+      model_or_engine="gpt-4o-mini", response_model="gpt-4o-mini",
+      physical_attempt=1, error_type=None)
+    self.call_guard = SimpleNamespace(logical_calls=1, physical_attempts=1)
+    snapshot = SimpleNamespace(
+      accumulated_cost=Decimal("0.000001"), ceiling=Decimal("0.01"),
+      remaining_cost=Decimal("0.009999"), tripped=False,
+      logical_calls=1, physical_attempts=1,
+      cost_by_operation=(("CHAT", Decimal("0.000001")),))
+    self.cost_guard = Mock()
+    self.cost_guard.snapshot.return_value = snapshot
+    self.cost_guard.records.return_value = (object(),)
+
+  def tearDown(self):
+    self.temporary.cleanup()
+
+  def capture(self):
+    try:
+      _raise_sanitized_index_error()
+    except IndexError as error:
+      return build_sanitized_failure_evidence(
+        error=error, repository_root=REPOSITORY,
+        temporary_root=self.temp_root, phase="PLANNING",
+        current_module="plan", telemetry=(self.event,),
+        call_guard=self.call_guard, cost_guard=self.cost_guard,
+        provider_call_count=1, network_call_count=0,
+        current_caller="act_obj_desc")
+    self.fail("IndexError was not raised")
+
+  def test_01_traceback_preserves_relative_file_function_line_and_phase(self):
+    evidence = self.capture()
+    failing = evidence["traceback"][-1]
+
+    self.assertEqual("IndexError", evidence["exception_type"])
+    self.assertEqual("PLAN_INDEX_ERROR", evidence["reason_code"])
+    self.assertEqual("reverie/backend_server/tests/test_controlled_replay.py",
+                     failing["file"])
+    self.assertEqual("_raise_sanitized_index_error", failing["function"])
+    self.assertIsInstance(failing["line"], int)
+    self.assertEqual("PLANNING", evidence["failure_phase"])
+    self.assertEqual("plan", evidence["current_module"])
+
+  def test_02_traceback_excludes_paths_content_and_locals(self):
+    serialized = json.dumps(self.capture())
+
+    self.assertNotIn(str(self.temp_root), serialized)
+    self.assertNotIn("PRIVATE-PROMPT-MARKER", serialized)
+    self.assertNotIn("PRIVATE-RESPONSE-MARKER", serialized)
+    self.assertNotIn("f_locals", serialized)
+    self.assertNotIn("source_line", serialized)
+
+  def test_03_runtime_attribution_and_failure_snapshots_are_complete(self):
+    evidence = self.capture()
+
+    self.assertEqual("act_obj_desc", evidence["current_caller"])
+    self.assertEqual("act_obj_desc", evidence["last_completed_caller"])
+    self.assertEqual("CHAT", evidence["operation"])
+    self.assertEqual(1, evidence["telemetry_events"])
+    self.assertEqual(1, evidence["ledger_records"])
+    self.assertEqual((1, 1, 0), (
+      evidence["logical_calls"], evidence["physical_attempts"],
+      evidence["retry_count"]))
+    self.assertEqual("0.000001", evidence["cost"]["accumulated"])
+    self.assertEqual("0.01", evidence["cost"]["ceiling"])
+    self.assertFalse(evidence["cost"]["tripped"])
+    self.assertEqual(1, evidence["provider_calls"])
+    self.assertEqual(0, evidence["network_calls"])
+
+  def test_04_collection_diagnostic_is_structural_and_content_free(self):
+    collection = self.capture()["collection"]
+
+    self.assertEqual({
+      "type": "list", "length": 0, "requested_index": 2,
+      "empty": True, "element_type_names": (), "source": "values",
+    }, collection)
+    serialized = json.dumps(collection)
+    self.assertNotIn("PRIVATE", serialized)
+    self.assertNotIn("[2]", serialized)
+
+  def test_05_diagnostic_introduces_no_provider_call_or_storage_mutation(self):
+    adapter = DeterministicReplayFakeAdapter()
+    protected = VERSIONED_BASELINE
+    before = {
+      path.relative_to(protected).as_posix(): hashlib.sha256(
+        path.read_bytes()).hexdigest()
+      for path in protected.rglob("*") if path.is_file()}
+
+    evidence = self.capture()
+
+    self.assertEqual([], adapter.calls)
+    self.assertEqual(1, evidence["provider_calls"])
+    self.assertEqual(before, {
+      path.relative_to(protected).as_posix(): hashlib.sha256(
+        path.read_bytes()).hexdigest()
+      for path in protected.rglob("*") if path.is_file()})
+
+  def test_06_runtime_contexts_teardown_after_index_error(self):
+    adapter = DeterministicReplayFakeAdapter()
+    try:
+      with use_embedding_runtime(
+          build_modern_embedding_runtime_config(), adapter):
+        with use_modern_chat_runtime(
+            build_modern_chat_runtime_config(), adapter):
+          with use_modern_completion_runtime(
+              build_modern_completion_runtime_config(), adapter):
+            _raise_sanitized_index_error()
+    except IndexError:
+      pass
+
+    self.assertTrue(controlled_replay_contexts_are_reset())
+    self.assertEqual([], adapter.calls)
+
+
+class TaskDecompFakeContractTests(unittest.TestCase):
+  def setUp(self):
+    reset_provider()
+    reset_llm_provider_config()
+    clear_telemetry()
+    baseline = VERSIONED_BASELINE
+    actor_fixture = build_controlled_replay_actor_fixture(
+      "Isabella Rodriguez",
+      baseline / "personas" / "Isabella Rodriguez" / "bootstrap_memory"
+      / "scratch.json",
+      baseline / "reverie" / "meta.json")
+    self.persona = SimpleNamespace(
+      name="Isabella Rodriguez", scratch=actor_fixture.persona.scratch)
+    self.assertIsInstance(self.persona.name, str)
+    self.assertTrue(self.persona.name)
+    self.assertIs(self.persona.scratch, actor_fixture.persona.scratch)
+    self.persona.scratch.f_daily_schedule_hourly_org = [
+      ["working", 60], ["resting", 60]]
+    self.context = LLMReplayContext(
+      cognitive_category="PLANNING", actor_id="Isabella Rodriguez",
+      simulation_id="task-decomp-micro", simulation_step=0)
+
+  def tearDown(self):
+    reset_provider()
+    reset_llm_provider_config()
+    clear_telemetry()
+
+  def invoke(self, adapter):
+    network_calls = []
+    def block_network(*args, **kwargs):
+      network_calls.append("blocked")
+      raise AssertionError("network is forbidden in task_decomp micro test")
+    with patch("socket.create_connection", side_effect=block_network), patch.object(
+        socket.socket, "connect", block_network):
+      with use_modern_completion_runtime(
+          build_modern_completion_runtime_config(), adapter):
+        with use_llm_replay_context(self.context):
+          with _historical_wrapper_environment():
+            result = run_gpt_prompt.run_gpt_prompt_task_decomp(
+              self.persona, "working", 60)
+    return result, get_telemetry(), network_calls
+
+  def test_01_dedicated_response_crosses_real_historical_contract_once(self):
+    adapter = R1TDeterministicFakeAdapter()
+
+    result, events, network_calls = self.invoke(adapter)
+
+    parsed, historical_metadata = result
+    self.assertIsInstance(result, tuple)
+    self.assertEqual(2, len(result))
+    self.assertIsInstance(historical_metadata, list)
+    self.assertTrue(parsed)
+    for entry in parsed:
+      self.assertIsInstance(entry, list)
+      self.assertEqual(2, len(entry))
+      self.assertIsInstance(entry[0], str)
+      self.assertIsInstance(entry[1], int)
+      self.assertGreater(entry[1], 0)
+    self.assertNotEqual(["asleep"], parsed)
+    self.assertEqual(1, len(adapter.calls))
+    self.assertEqual("task_decomp", adapter.calls[0]["caller_id"])
+    self.assertEqual("gpt-4o-mini", adapter.calls[0]["model"])
+    self.assertEqual(1, len(events))
+    self.assertEqual(1, len({event.logical_call_id for event in events}))
+    self.assertEqual(1, events[0].physical_attempt)
+    self.assertEqual("task_decomp", events[0].caller_id)
+    self.assertEqual(COMPLETION_COMPAT, events[0].operation)
+    self.assertEqual("SUCCESS", events[0].outcome)
+    self.assertEqual([], network_calls)
+    telemetry_text = repr(events)
+    self.assertNotIn(R1T_TASK_DECOMP_FAKE_RESPONSE, telemetry_text)
+    self.assertNotIn("working", telemetry_text)
+    self.assertTrue(controlled_replay_contexts_are_reset())
+
+  def test_02_generic_responses_exhaust_retries_into_structured_fail_safe(self):
+    adapter = DeterministicReplayFakeAdapter(
+      text_responses=(R1T_GENERIC_FAKE_RESPONSE,) * 5)
+
+    result, events, network_calls = self.invoke(adapter)
+
+    self.assertEqual([["working (working)", 60]], result[0])
+    self.assertEqual(5, len(events))
+    self.assertEqual(5, len(adapter.calls))
+    self.assertTrue(all(event.caller_id == "task_decomp" for event in events))
+    self.assertEqual([1, 2, 3, 4, 5],
+                     [event.physical_attempt for event in events])
+    self.assertEqual([], network_calls)
+    self.assertTrue(controlled_replay_contexts_are_reset())
+
+  def test_03_only_task_decomp_differs_from_the_existing_fake_matrix(self):
+    self.assertEqual(
+      R1T_TASK_DECOMP_FAKE_RESPONSE,
+      R1TDeterministicFakeAdapter.response_for_caller("task_decomp"))
+    self.assertNotEqual(
+      R1T_GENERIC_FAKE_RESPONSE,
+      R1TDeterministicFakeAdapter.response_for_caller("task_decomp"))
+    self.assertEqual(
+      R1T_PRONUNCIATIO_FAKE_RESPONSE,
+      R1TDeterministicFakeAdapter.response_for_caller("pronunciatio"))
+    self.assertEqual(
+      R1T_ACT_OBJ_DESC_FAKE_RESPONSE,
+      R1TDeterministicFakeAdapter.response_for_caller("act_obj_desc"))
+    self.assertEqual(
+      R1T_GENERIC_FAKE_RESPONSE,
+      R1TDeterministicFakeAdapter.response_for_caller("wake_up_hour"))
 
 
 class ControlledReplayTests(unittest.TestCase):
@@ -509,12 +1192,8 @@ class ControlledReplayTests(unittest.TestCase):
       report = self.execute_replay()
     self.assertEqual("SUCCESS", report.status)
 
-  def test_32_real_runtime_artifacts_are_unchanged(self):
-    paths = (
-      REPOSITORY / "environment/frontend_server/temp_storage/curr_sim_code.json",
-      REPOSITORY / "environment/frontend_server/temp_storage/curr_step.json",
-      REPOSITORY / "environment/frontend_server/storage/ego-vivens-lab-01",
-    )
+  def test_32_versioned_baseline_is_unchanged(self):
+    paths = (VERSIONED_BASELINE,)
 
     def snapshot(path):
       if not path.exists():

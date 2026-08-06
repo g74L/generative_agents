@@ -33,6 +33,74 @@ def get_random_alphanumeric(i=6, j=6):
 
 
 EMPTY_RESPONSE = "EMPTY_RESPONSE"
+
+_TASK_DECOMP_LIST_PREFIX_RE = re.compile(
+  r"^\s*(?:(?:\d+\s*[.)\:-])|[-*])\s*")
+_TASK_DECOMP_LINE_RE = re.compile(
+  r"^(?P<task>.+?)\s*"
+  r"\(\s*duration in minutes\s*:\s*(?P<duration>[+-]?\d+)\s*"
+  r"(?:,\s*minutes left\s*:\s*\d+\s*)?\)\s*[,.]?\s*$",
+  re.IGNORECASE)
+_TASK_DECOMP_TOTAL_RE = re.compile(
+  r"\(\s*total duration in minutes\s*:?\s*(\d+)\s*\)\s*:",
+  re.IGNORECASE)
+
+
+def _parse_task_decomp_response(gpt_response, prompt):
+  """Parse the legacy task-decomposition format without leaking raw text."""
+  if not isinstance(gpt_response, str):
+    raise ValueError("TASK_DECOMP_RESPONSE_INVALID_TYPE")
+
+  lines = [line.strip() for line in gpt_response.splitlines()
+           if line.strip()]
+  if not lines:
+    raise ValueError("TASK_DECOMP_RESPONSE_EMPTY")
+
+  parsed = []
+  for line_number, line in enumerate(lines, 1):
+    normalized = _TASK_DECOMP_LIST_PREFIX_RE.sub("", line, count=1)
+    match = _TASK_DECOMP_LINE_RE.fullmatch(normalized)
+    if not match:
+      raise ValueError(
+        f"TASK_DECOMP_RESPONSE_LINE_INVALID: line={line_number}")
+    task = match.group("task").strip()
+    if task.endswith("."):
+      task = task[:-1].rstrip()
+    if not task:
+      raise ValueError(
+        f"TASK_DECOMP_RESPONSE_TASK_EMPTY: line={line_number}")
+    duration = int(match.group("duration"))
+    if duration <= 0:
+      raise ValueError(
+        f"TASK_DECOMP_RESPONSE_DURATION_INVALID: line={line_number}")
+    parsed.append([task, duration])
+
+  totals = _TASK_DECOMP_TOTAL_RE.findall(prompt or "")
+  if not totals:
+    raise ValueError("TASK_DECOMP_PROMPT_TOTAL_INVALID")
+  total_expected_min = int(totals[-1])
+  if total_expected_min <= 0:
+    raise ValueError("TASK_DECOMP_PROMPT_TOTAL_INVALID")
+
+  minute_slots = []
+  for task, duration in parsed:
+    normalized_duration = duration - (duration % 5)
+    minute_slots.extend([task] * normalized_duration)
+  if not minute_slots:
+    raise ValueError("TASK_DECOMP_RESPONSE_DURATION_ALIGNMENT_EMPTY")
+  if len(minute_slots) > total_expected_min:
+    minute_slots = minute_slots[:total_expected_min]
+  elif len(minute_slots) < total_expected_min:
+    minute_slots.extend(
+      [minute_slots[-1]] * (total_expected_min - len(minute_slots)))
+
+  result = []
+  for task in minute_slots:
+    if result and result[-1][0] == task:
+      result[-1][1] += 1
+    else:
+      result.append([task, 1])
+  return result
 AM_MARKER_MISSING = "AM_MARKER_MISSING"
 NON_INTEGER_PREFIX = "NON_INTEGER_PREFIX"
 MINUTES_FORMAT_PRESENT = "MINUTES_FORMAT_PRESENT"
@@ -361,14 +429,9 @@ def run_gpt_prompt_task_decomp(persona,
 
     curr_time_range = ""
 
-    print ("DEBUG")
-    print (persona.scratch.f_daily_schedule_hourly_org)
-    print (all_indices)
-
     summ_str = f'Today is {persona.scratch.curr_time.strftime("%B %d, %Y")}. '
     summ_str += f'From '
     for index in all_indices: 
-      print ("index", index)
       if index < len(persona.scratch.f_daily_schedule_hourly_org): 
         start_min = 0
         for i in range(index): 
@@ -398,74 +461,17 @@ def run_gpt_prompt_task_decomp(persona,
     return prompt_input
 
   def __func_clean_up(gpt_response, prompt=""):
-    print ("TOODOOOOOO")
-    print (gpt_response)
-    print ("-==- -==- -==- ")
-
-    # TODO SOMETHING HERE sometimes fails... See screenshot
-    temp = [i.strip() for i in gpt_response.split("\n")]
-    _cr = []
-    cr = []
-    for count, i in enumerate(temp): 
-      if count != 0: 
-        _cr += [" ".join([j.strip () for j in i.split(" ")][3:])]
-      else: 
-        _cr += [i]
-    for count, i in enumerate(_cr): 
-      k = [j.strip() for j in i.split("(duration in minutes:")]
-      task = k[0]
-      if task[-1] == ".": 
-        task = task[:-1]
-      duration = int(k[1].split(",")[0].strip())
-      cr += [[task, duration]]
-
-    total_expected_min = int(prompt.split("(total duration in minutes")[-1]
-                                   .split("):")[0].strip())
-    
-    # TODO -- now, you need to make sure that this is the same as the sum of 
-    #         the current action sequence. 
-    curr_min_slot = [["dummy", -1],] # (task_name, task_index)
-    for count, i in enumerate(cr): 
-      i_task = i[0] 
-      i_duration = i[1]
-
-      i_duration -= (i_duration % 5)
-      if i_duration > 0: 
-        for j in range(i_duration): 
-          curr_min_slot += [(i_task, count)]       
-    curr_min_slot = curr_min_slot[1:]   
-
-    if len(curr_min_slot) > total_expected_min: 
-      last_task = curr_min_slot[60]
-      for i in range(1, 6): 
-        curr_min_slot[-1 * i] = last_task
-    elif len(curr_min_slot) < total_expected_min: 
-      last_task = curr_min_slot[-1]
-      for i in range(total_expected_min - len(curr_min_slot)):
-        curr_min_slot += [last_task]
-
-    cr_ret = [["dummy", -1],]
-    for task, task_index in curr_min_slot: 
-      if task != cr_ret[-1][0]: 
-        cr_ret += [[task, 1]]
-      else: 
-        cr_ret[-1][1] += 1
-    cr = cr_ret[1:]
-
-    return cr
+    return _parse_task_decomp_response(gpt_response, prompt)
 
   def __func_validate(gpt_response, prompt=""): 
-    # TODO -- this sometimes generates error 
     try: 
-      __func_clean_up(gpt_response)
-    except: 
-      pass
-      # return False
-    return gpt_response
+      _parse_task_decomp_response(gpt_response, prompt)
+    except ValueError:
+      return False
+    return True
 
   def get_fail_safe(): 
-    fs = ["asleep"]
-    return fs
+    return [[task, duration]]
 
   gpt_param = {"engine": "text-davinci-003", "max_tokens": 1000, 
              "temperature": 0, "top_p": 1, "stream": False,
@@ -475,8 +481,6 @@ def run_gpt_prompt_task_decomp(persona,
   prompt = generate_prompt(prompt_input, prompt_template)
   fail_safe = get_fail_safe()
 
-  print ("?????")
-  print (prompt)
   output = safe_generate_response(prompt, gpt_param, 5, get_fail_safe(),
                                    __func_validate, __func_clean_up,
                                    caller_id="task_decomp")
@@ -490,12 +494,6 @@ def run_gpt_prompt_task_decomp(persona,
   fin_output[-1][1] += (duration - ftime_sum)
   IndexError: list index out of range
   """
-
-  print ("IMPORTANT VVV DEBUG")
-
-  # print (prompt_input)
-  # print (prompt)
-  print (output)
 
   fin_output = []
   time_sum = 0
@@ -879,8 +877,12 @@ def run_gpt_prompt_pronunciatio(action_description, persona, verbose=False):
   example_output = "🛁🧖‍♀️" ########
   special_instruction = "The value for the output must ONLY contain the emojis." ########
   fail_safe = get_fail_safe()
-  output = ChatGPT_safe_generate_response(prompt, example_output, special_instruction, 3, fail_safe,
-                                          __chat_func_validate, __chat_func_clean_up, True)
+  with use_modern_chat_caller(
+      "pronunciatio", "gpt-4o-mini", gpt_param["temperature"],
+      gpt_param["max_tokens"], gpt_param["stop"]):
+    output = ChatGPT_safe_generate_response(
+      prompt, example_output, special_instruction, 3, fail_safe,
+      __chat_func_validate, __chat_func_clean_up, False)
   if output != False: 
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
@@ -1056,8 +1058,12 @@ def run_gpt_prompt_act_obj_desc(act_game_object, act_desp, persona, verbose=Fals
   example_output = "being fixed" ########
   special_instruction = "The output should ONLY contain the phrase that should go in <fill in>." ########
   fail_safe = get_fail_safe(act_game_object) ########
-  output = ChatGPT_safe_generate_response(prompt, example_output, special_instruction, 3, fail_safe,
-                                          __chat_func_validate, __chat_func_clean_up, True)
+  with use_modern_chat_caller(
+      "act_obj_desc", "gpt-4o-mini", gpt_param["temperature"],
+      gpt_param["max_tokens"], gpt_param["stop"]):
+    output = ChatGPT_safe_generate_response(
+      prompt, example_output, special_instruction, 3, fail_safe,
+      __chat_func_validate, __chat_func_clean_up, False)
   if output != False: 
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
@@ -1942,8 +1948,12 @@ def run_gpt_prompt_event_poignancy(persona, event_description, test_input=None, 
   example_output = "5" ########
   special_instruction = "The output should ONLY contain ONE integer value on the scale of 1 to 10." ########
   fail_safe = get_fail_safe() ########
-  output = ChatGPT_safe_generate_response(prompt, example_output, special_instruction, 3, fail_safe,
-                                          __chat_func_validate, __chat_func_clean_up, True)
+  with use_modern_chat_caller(
+      "event_poignancy", "gpt-4o-mini", gpt_param["temperature"],
+      gpt_param["max_tokens"], gpt_param["stop"]):
+    output = ChatGPT_safe_generate_response(
+      prompt, example_output, special_instruction, 3, fail_safe,
+      __chat_func_validate, __chat_func_clean_up, False)
   if output != False: 
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================

@@ -90,6 +90,7 @@ celerybeat-schedule
 
 # dotenv
 .env
+.env.*
 
 # virtualenv
 venv/
@@ -102,4 +103,5 @@ ENV/
 .ropeproject
 .venv/
 .venv-modern-contract/
+.runtime/
 

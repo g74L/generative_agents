@@ -8,6 +8,9 @@ import json
 import random
 import openai
 import time 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import replace
 
 from persona.memory_structures.embedding_space import (
   get_runtime_embedding_manifest,
@@ -18,16 +21,67 @@ from persona.prompt_template.completion_runtime import (
   is_modern_completion_runtime_active,
   run_legacy_completion_compat,
 )
+from persona.prompt_template.chat_runtime import (
+  ModernChatRequest,
+  ModernChatRequestError,
+  ModernChatRuntimeInactiveError,
+  get_modern_chat_runtime_config,
+  run_modern_chat,
+  validate_modern_chat_caller,
+)
 from persona.prompt_template.llm_provider import (
+  PLANNING,
   chat_completion,
   embedding,
+  get_llm_replay_context,
   logical_call,
   text_completion,
+  use_llm_replay_context,
 )
 from persona.prompt_template.modern_openai_provider import (
+  LLMAuthenticationError,
+  LLMAuthorizationError,
   LLMIncompleteResponseError,
+  LLMInvalidRequestError,
+  LLMModelNotFoundError,
+  LLMRefusalError,
+  LLMUnsupportedOperationError,
+  ModernOpenAISdkUnavailableError,
 )
 from persona.prompt_template.replay_cost_guard import ReplayCostGuardError
+
+
+CHAT_POLICY_ERRORS = (
+  ModernChatRequestError,
+  ModernChatRuntimeInactiveError,
+  ModernOpenAISdkUnavailableError,
+  LLMAuthenticationError,
+  LLMAuthorizationError,
+  LLMModelNotFoundError,
+  LLMInvalidRequestError,
+  LLMRefusalError,
+  LLMUnsupportedOperationError,
+  ReplayCostGuardError,
+)
+
+_modern_chat_caller_options = ContextVar(
+  "modern_chat_caller_options", default=None)
+
+
+@contextmanager
+def use_modern_chat_caller(caller_id, model, temperature, max_tokens, stop):
+  validate_modern_chat_caller(caller_id)
+  token = _modern_chat_caller_options.set({
+    "caller_id": caller_id,
+    "model": model,
+    "temperature": temperature,
+    "max_tokens": max_tokens,
+    "stop": stop,
+  })
+  try:
+    yield
+  finally:
+    _modern_chat_caller_options.reset(token)
 
 def temp_sleep(seconds=0.1):
   time.sleep(seconds)
@@ -72,7 +126,7 @@ def GPT4_request(prompt):
     return "ChatGPT ERROR"
 
 
-def ChatGPT_request(prompt): 
+def ChatGPT_request(prompt):
   """
   Given a prompt and a dictionary of GPT parameters, make a request to OpenAI
   server and returns the response. 
@@ -95,6 +149,22 @@ def ChatGPT_request(prompt):
   except: 
     print ("ChatGPT ERROR")
     return "ChatGPT ERROR"
+
+
+def _modern_ChatGPT_request(prompt, *, caller_id, model,
+                            temperature, max_tokens, stop):
+  validate_modern_chat_caller(caller_id)
+  effective_context = replace(
+    get_llm_replay_context(), caller_id=caller_id,
+    cognitive_category=PLANNING)
+  with use_llm_replay_context(effective_context):
+    return run_modern_chat(ModernChatRequest(
+      messages=({"role": "user", "content": prompt},),
+      model=model,
+      temperature=temperature,
+      max_tokens=max_tokens,
+      stop=stop,
+    )).content
 
 
 def GPT4_safe_generate_response(prompt, 
@@ -144,7 +214,7 @@ def ChatGPT_safe_generate_response(prompt,
                                    fail_safe_response="error",
                                    func_validate=None,
                                    func_clean_up=None,
-                                   verbose=False): 
+                                   verbose=False):
   # prompt = 'GPT-3 Prompt:\n"""\n' + prompt + '\n"""\n'
   prompt = '"""\n' + prompt + '\n"""\n'
   prompt += f"Output the response to the prompt above in json. {special_instruction}\n"
@@ -159,7 +229,16 @@ def ChatGPT_safe_generate_response(prompt,
     for i in range(repeat):
 
       try:
-        curr_gpt_response = ChatGPT_request(prompt).strip()
+        modern_options = _modern_chat_caller_options.get()
+        if (modern_options is not None
+            or get_modern_chat_runtime_config() is not None):
+          modern_options = modern_options or {
+            "caller_id": None, "model": None, "temperature": None,
+            "max_tokens": None, "stop": None}
+          curr_gpt_response = _modern_ChatGPT_request(
+            prompt, **modern_options).strip()
+        else:
+          curr_gpt_response = ChatGPT_request(prompt).strip()
         end_index = curr_gpt_response.rfind('}') + 1
         curr_gpt_response = curr_gpt_response[:end_index]
         curr_gpt_response = json.loads(curr_gpt_response)["output"]
@@ -176,6 +255,8 @@ def ChatGPT_safe_generate_response(prompt,
           print (curr_gpt_response)
           print ("~~~~")
 
+      except CHAT_POLICY_ERRORS:
+        raise
       except:
         pass
 

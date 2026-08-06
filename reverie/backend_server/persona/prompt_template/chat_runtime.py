@@ -55,8 +55,24 @@ class ModernChatModelMismatchError(ModernChatRequestError):
   pass
 
 
+class ModernChatCallerNotAllowedError(ModernChatRequestError):
+  pass
+
+
 class ModernChatValidationError(ModernChatRuntimeError):
   pass
+
+
+M5_REPLAY_CALLER_ALLOWLIST = (
+  "pronunciatio", "act_obj_desc", "event_poignancy")
+
+
+def validate_modern_chat_caller(caller_id):
+  if (not isinstance(caller_id, str) or not caller_id.strip()
+      or caller_id not in M5_REPLAY_CALLER_ALLOWLIST):
+    raise ModernChatCallerNotAllowedError(
+      "Modern Chat caller is missing or not authorized")
+  return caller_id
 
 
 @dataclass(frozen=True)

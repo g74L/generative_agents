@@ -1,11 +1,13 @@
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from decimal import Decimal
 import io
+import os
 from pathlib import Path
 import socket
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -14,7 +16,9 @@ if str(BACKEND_SERVER) not in sys.path:
   sys.path.insert(0, str(BACKEND_SERVER))
 
 from persona.prompt_template.chat_runtime import (
+  M5_REPLAY_CALLER_ALLOWLIST,
   M5_CHAT_MODEL,
+  ModernChatCallerNotAllowedError,
   ModernChatModelMismatchError,
   ModernChatRequest,
   ModernChatRequestError,
@@ -26,6 +30,7 @@ from persona.prompt_template.chat_runtime import (
   run_modern_chat,
   use_modern_chat_runtime,
 )
+from persona.prompt_template import gpt_structure, run_gpt_prompt
 from persona.prompt_template.cost_ledger import (
   COMPLETE,
   ModelPricing,
@@ -53,12 +58,16 @@ from persona.prompt_template.llm_provider import (
   get_completion_provider,
   get_embedding_provider,
   get_embedding_cache_stats,
+  get_llm_replay_context,
   get_provider,
   get_telemetry,
   reset_embedding_cache,
   reset_provider,
   text_completion,
+  use_llm_replay_context,
   use_provider,
+  LLMReplayContext,
+  PLANNING,
 )
 from persona.prompt_template.llm_provider_config import (
   DEFAULT_LLM_PROVIDER_CONFIG,
@@ -86,6 +95,11 @@ from persona.prompt_template.modern_openai_provider import (
   map_modern_sdk_error,
   normalize_chat_response,
 )
+from persona.prompt_template.replay_cost_guard import ReplayCostGuardError
+from persona.prompt_template.replay_cost_guard import (
+  ReplayCostCeilingExceededError,
+)
+from controlled_replay import ReplayLogicalCallLimitExceededError
 
 
 class FakeModernChatAdapter:
@@ -875,6 +889,327 @@ class ModernChatRuntimeTests(unittest.TestCase):
     self.assertIsInstance(mapped, LLMServerError)
     self.assertEqual("req-valid-server", mapped.request_id)
     self.assertEqual(503, mapped.provider_status)
+
+  def _pronunciatio(self, adapter, action="painting"):
+    persona = SimpleNamespace(name="Isabella Rodriguez")
+    with self._backend_workdir(), redirect_stdout(io.StringIO()), (
+        use_modern_chat_runtime(self.config(), adapter)):
+      result = run_gpt_prompt.run_gpt_prompt_pronunciatio(action, persona)
+      return result[0] if result is not None else None
+
+  @contextmanager
+  def _backend_workdir(self):
+    previous = Path.cwd()
+    os.chdir(BACKEND_SERVER)
+    try:
+      yield
+    finally:
+      os.chdir(previous)
+
+  def test_104_pronunciatio_uses_attributed_modern_chat(self):
+    adapter = FakeModernChatAdapter(response('{"output":"🎨"}'))
+    with use_llm_replay_context(LLMReplayContext(
+        cognitive_category="UNSPECIFIED", actor_id="Isabella Rodriguez",
+        simulation_id="offline-pronunciatio", simulation_step=0)):
+      output = self._pronunciatio(adapter)
+    event = get_telemetry()[0]
+    self.assertEqual("🎨", output)
+    self.assertEqual((M5_CHAT_MODEL, 0, 15, None), (
+      adapter.calls[0]["model"], adapter.calls[0]["temperature"],
+      adapter.calls[0]["max_tokens"], adapter.calls[0]["stop"]))
+    self.assertEqual(("pronunciatio", PLANNING),
+                     (event.caller_id, event.cognitive_category))
+    self.assertEqual((MODERN_OPENAI, MODERN_TRANSPORT),
+                     (event.provider_kind, event.transport_kind))
+
+  def test_105_pronunciatio_preserves_one_user_message_and_prompt(self):
+    marker = "PRIVATE-PRONUNCIATIO-INPUT"
+    adapter = FakeModernChatAdapter(response('{"output":"🎨"}'))
+    self._pronunciatio(adapter, marker)
+    messages = adapter.calls[0]["messages"]
+    self.assertEqual(1, len(messages))
+    self.assertEqual("user", messages[0]["role"])
+    self.assertIn(marker, messages[0]["content"])
+    self.assertIn('Example output json:', messages[0]["content"])
+    self.assertNotIn(marker, repr(get_telemetry()))
+    self.assertNotIn("🎨", repr(get_telemetry()))
+
+  def test_106_pronunciatio_cleanup_remains_three_characters(self):
+    adapter = FakeModernChatAdapter(response('{"output":"abcdef"}'))
+    self.assertEqual("abc", self._pronunciatio(adapter))
+
+  def test_107_invalid_response_uses_historical_three_attempts_and_fallback(self):
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response("still-not-json"), response("bad"))
+    output = self._pronunciatio(adapter)
+    self.assertIsNone(output)
+    self.assertEqual(3, len(adapter.calls))
+    self.assertEqual(1, len({event.logical_call_id
+                            for event in get_telemetry()}))
+
+  def test_108_invalid_then_valid_response_retries_semantically(self):
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response('{"output":"🎨"}'))
+    self.assertEqual("🎨", self._pronunciatio(adapter))
+    self.assertEqual(2, len(adapter.calls))
+
+  def test_109_policy_error_is_rethrown_without_second_provider_call(self):
+    adapter = FakeModernChatAdapter(
+      LLMAuthenticationError("denied"), response('{"output":"must-not-run"}'))
+    with self.assertRaises(LLMAuthenticationError):
+      self._pronunciatio(adapter)
+    self.assertEqual(1, len(adapter.calls))
+
+  def test_110_replay_guard_error_is_not_swallowed(self):
+    adapter = FakeModernChatAdapter(
+      ReplayCostGuardError("tripped"), response('{"output":"must-not-run"}'))
+    with self.assertRaises(ReplayCostGuardError):
+      self._pronunciatio(adapter)
+    self.assertEqual(1, len(adapter.calls))
+
+  def test_110a_replay_logical_limit_error_is_not_swallowed(self):
+    adapter = FakeModernChatAdapter(
+      ReplayLogicalCallLimitExceededError(1),
+      response('{"output":"must-not-run"}'))
+    with self.assertRaises(ReplayLogicalCallLimitExceededError):
+      self._pronunciatio(adapter)
+    self.assertEqual(1, len(adapter.calls))
+
+  def test_110b_cost_ceiling_error_is_not_swallowed(self):
+    adapter = FakeModernChatAdapter(
+      ReplayCostCeilingExceededError(
+        Decimal("0.002"), Decimal("0.001"), CHAT, M5_CHAT_MODEL),
+      response('{"output":"must-not-run"}'))
+    with self.assertRaises(ReplayCostCeilingExceededError):
+      self._pronunciatio(adapter)
+    self.assertEqual(1, len(adapter.calls))
+
+  def test_111_provider_configuration_error_is_not_swallowed(self):
+    adapter = FakeModernChatAdapter(
+      LLMInvalidRequestError("invalid configuration"),
+      response('{"output":"must-not-run"}'))
+    with self.assertRaises(LLMInvalidRequestError):
+      self._pronunciatio(adapter)
+    self.assertEqual(1, len(adapter.calls))
+
+  def test_112_transient_provider_error_keeps_historical_retry(self):
+    adapter = FakeModernChatAdapter(
+      LLMTimeoutError("temporary"), response('{"output":"🎨"}'))
+    self.assertEqual("🎨", self._pronunciatio(adapter))
+    self.assertEqual(2, len(adapter.calls))
+    self.assertEqual(1, len({event.logical_call_id
+                            for event in get_telemetry()}))
+
+  def test_113_inactive_runtime_fails_closed_without_legacy_fallback(self):
+    with patch.object(gpt_structure, "chat_completion",
+                      side_effect=AssertionError("legacy Chat reached")) as legacy:
+      with self._backend_workdir(), redirect_stdout(io.StringIO()), (
+          self.assertRaises(ModernChatRuntimeInactiveError)):
+        run_gpt_prompt.run_gpt_prompt_pronunciatio(
+          "painting", SimpleNamespace(name="Isabella Rodriguez"))
+    legacy.assert_not_called()
+
+  def _event_poignancy(self, adapter, event="event",
+                       persona_name="Isabella Rodriguez"):
+    scratch = SimpleNamespace(
+      name=persona_name, get_str_iss=lambda: "identity")
+    with self._backend_workdir(), redirect_stdout(io.StringIO()), (
+        use_modern_chat_runtime(self.config(), adapter)):
+      result = run_gpt_prompt.run_gpt_prompt_event_poignancy(
+        SimpleNamespace(scratch=scratch), event)
+      return result[0] if result is not None else None
+
+  def test_114_event_poignancy_uses_attributed_modern_chat(self):
+    adapter = FakeModernChatAdapter(response('{"output":"7"}'))
+    context = LLMReplayContext(
+      cognitive_category="PERCEPTION", actor_id="Isabella Rodriguez",
+      simulation_id="offline-event-poignancy", simulation_step=1)
+    with use_llm_replay_context(context):
+      output = self._event_poignancy(adapter)
+    event = get_telemetry()[0]
+    ledger = build_cost_ledger_records(get_telemetry())[0]
+    self.assertEqual(7, output)
+    self.assertEqual((M5_CHAT_MODEL, 0, 15, None), (
+      adapter.calls[0]["model"], adapter.calls[0]["temperature"],
+      adapter.calls[0]["max_tokens"], adapter.calls[0]["stop"]))
+    self.assertEqual(("event_poignancy", CHAT, M5_CHAT_MODEL), (
+      event.caller_id, event.operation, event.model_or_engine))
+    self.assertEqual(("Isabella Rodriguez", "offline-event-poignancy", 1), (
+      event.actor_id, event.simulation_id, event.simulation_step))
+    self.assertEqual(("event_poignancy", PLANNING),
+                     (ledger.caller_id, ledger.cognitive_category))
+    self.assertEqual(
+      ("pronunciatio", "act_obj_desc", "event_poignancy"),
+      M5_REPLAY_CALLER_ALLOWLIST)
+
+  def test_115_pronunciatio_micro_run_is_one_call_without_legacy_detection(self):
+    adapter = FakeModernChatAdapter(response('{"output":"🎨"}'))
+    with patch.object(socket, "getaddrinfo",
+                      side_effect=AssertionError("network reached")) as dns:
+      self.assertEqual("🎨", self._pronunciatio(adapter))
+    events = get_telemetry()
+    self.assertEqual(1, len(events))
+    self.assertEqual((1, 1), (
+      len({event.logical_call_id for event in events}),
+      sum(event.physical_attempt for event in events)))
+    self.assertEqual([M5_CHAT_MODEL], [event.model_or_engine for event in events])
+    self.assertNotIn("gpt-3.5-turbo", [event.model_or_engine for event in events])
+    dns.assert_not_called()
+    self.assertIsNone(get_modern_chat_runtime_config())
+    self.assertEqual(LLMReplayContext(), get_llm_replay_context())
+
+  def _act_obj_desc(self, adapter, game_object="bed", action="sleeping",
+                    persona_name="Isabella Rodriguez"):
+    persona = SimpleNamespace(name=persona_name)
+    with self._backend_workdir(), redirect_stdout(io.StringIO()), (
+        use_modern_chat_runtime(self.config(), adapter)):
+      result = run_gpt_prompt.run_gpt_prompt_act_obj_desc(
+        game_object, action, persona)
+      return result[0] if result is not None else None
+
+  def test_116_act_obj_desc_uses_attributed_modern_chat(self):
+    adapter = FakeModernChatAdapter(response('{"output":"bed is made."}'))
+    output = self._act_obj_desc(adapter)
+    event = get_telemetry()[0]
+    self.assertEqual("bed is made", output)
+    self.assertIsInstance(output, str)
+    self.assertEqual((M5_CHAT_MODEL, 0, 15, None), (
+      adapter.calls[0]["model"], adapter.calls[0]["temperature"],
+      adapter.calls[0]["max_tokens"], adapter.calls[0]["stop"]))
+    self.assertEqual(("act_obj_desc", PLANNING),
+                     (event.caller_id, event.cognitive_category))
+    self.assertEqual((MODERN_OPENAI, MODERN_TRANSPORT),
+                     (event.provider_kind, event.transport_kind))
+
+  def test_117_act_obj_desc_preserves_prompt_inputs_and_message_shape(self):
+    markers = ("PRIVATE-OBJECT", "PRIVATE-ACTION", "PRIVATE-PERSONA")
+    adapter = FakeModernChatAdapter(response('{"output":"state"}'))
+    self._act_obj_desc(adapter, *markers)
+    messages = adapter.calls[0]["messages"]
+    self.assertEqual(1, len(messages))
+    self.assertEqual("user", messages[0]["role"])
+    for marker in markers:
+      self.assertIn(marker, messages[0]["content"])
+      self.assertNotIn(marker, repr(get_telemetry()))
+    self.assertNotIn("state", repr(get_telemetry()))
+
+  def test_118_act_obj_desc_invalid_response_keeps_three_attempts(self):
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response("still-invalid"), response("bad"))
+    self.assertIsNone(self._act_obj_desc(adapter))
+    self.assertEqual(3, len(adapter.calls))
+    self.assertEqual(1, len({event.logical_call_id
+                            for event in get_telemetry()}))
+
+  def test_119_act_obj_desc_invalid_then_valid_retries_semantically(self):
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response('{"output":"bed is made."}'))
+    self.assertEqual("bed is made", self._act_obj_desc(adapter))
+    self.assertEqual(2, len(adapter.calls))
+
+  def test_120_act_obj_desc_policy_error_hard_fails(self):
+    adapter = FakeModernChatAdapter(
+      LLMAuthenticationError("denied"), response('{"output":"must-not-run"}'))
+    with self.assertRaises(LLMAuthenticationError):
+      self._act_obj_desc(adapter)
+    self.assertEqual(1, len(adapter.calls))
+    self.assertIsNone(get_modern_chat_runtime_config())
+    self.assertEqual(LLMReplayContext(), get_llm_replay_context())
+
+  def test_121_act_obj_desc_cost_and_logical_limits_are_not_swallowed(self):
+    errors = (
+      ReplayLogicalCallLimitExceededError(1),
+      ReplayCostCeilingExceededError(
+        Decimal("0.002"), Decimal("0.001"), CHAT, M5_CHAT_MODEL),
+    )
+    for error in errors:
+      with self.subTest(error=type(error).__name__):
+        clear_telemetry()
+        adapter = FakeModernChatAdapter(
+          error, response('{"output":"must-not-run"}'))
+        with self.assertRaises(type(error)):
+          self._act_obj_desc(adapter)
+        self.assertEqual(1, len(adapter.calls))
+
+  def test_122_act_obj_desc_transient_error_keeps_historical_retry(self):
+    adapter = FakeModernChatAdapter(
+      LLMTimeoutError("temporary"), response('{"output":"state"}'))
+    self.assertEqual("state", self._act_obj_desc(adapter))
+    self.assertEqual(2, len(adapter.calls))
+    self.assertEqual(1, len({event.logical_call_id
+                            for event in get_telemetry()}))
+
+  def test_123_act_obj_desc_one_call_no_network_or_legacy(self):
+    adapter = FakeModernChatAdapter(response('{"output":"state"}'))
+    with patch.object(socket, "getaddrinfo",
+                      side_effect=AssertionError("network reached")) as dns:
+      self.assertEqual("state", self._act_obj_desc(adapter))
+    events = get_telemetry()
+    self.assertEqual(1, len(events))
+    self.assertEqual((1, 1), (
+      len({event.logical_call_id for event in events}), len(events)))
+    self.assertEqual("act_obj_desc", events[0].caller_id)
+    self.assertEqual(M5_CHAT_MODEL, events[0].model_or_engine)
+    self.assertNotEqual("gpt-3.5-turbo", events[0].model_or_engine)
+    dns.assert_not_called()
+
+  def test_124_pronunciatio_remains_operational_with_exact_allowlist(self):
+    self.assertEqual(
+      "🎨", self._pronunciatio(
+        FakeModernChatAdapter(response('{"output":"🎨"}'))))
+    self.assertEqual(
+      ("pronunciatio", "act_obj_desc", "event_poignancy"),
+      M5_REPLAY_CALLER_ALLOWLIST)
+
+  def test_125_event_poignancy_preserves_prompt_and_privacy(self):
+    marker = "PRIVATE-EVENT-POIGNANCY"
+    adapter = FakeModernChatAdapter(response('{"output":"6"}'))
+    self.assertEqual(6, self._event_poignancy(adapter, marker))
+    messages = adapter.calls[0]["messages"]
+    self.assertEqual((1, "user"), (len(messages), messages[0]["role"]))
+    self.assertIn(marker, messages[0]["content"])
+    self.assertIn('Example output json:', messages[0]["content"])
+    self.assertNotIn(marker, repr(get_telemetry()))
+    self.assertNotIn('{"output":"6"}', repr(get_telemetry()))
+
+  def test_126_event_poignancy_invalid_output_keeps_three_attempts(self):
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response('{"output":"not-an-int"}'),
+      response("still-invalid"))
+    self.assertIsNone(self._event_poignancy(adapter))
+    self.assertEqual(3, len(adapter.calls))
+    self.assertEqual(1, len({event.logical_call_id
+                            for event in get_telemetry()}))
+
+  def test_127_event_poignancy_invalid_then_valid_preserves_parser(self):
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response('{"output":"8"}'))
+    self.assertEqual(8, self._event_poignancy(adapter))
+    self.assertEqual(2, len(adapter.calls))
+
+  def test_128_missing_and_unknown_callers_hard_fail_before_provider(self):
+    adapter = FakeModernChatAdapter(response('{"output":"must-not-run"}'))
+    with use_modern_chat_runtime(self.config(), adapter):
+      for caller in (None, "unknown_chat_caller"):
+        with self.subTest(caller=caller), (
+            self.assertRaises(ModernChatCallerNotAllowedError)):
+          with gpt_structure.use_modern_chat_caller(
+              caller, M5_CHAT_MODEL, 0, 15, None):
+            pass
+    self.assertEqual([], adapter.calls)
+
+  def test_129_event_poignancy_one_success_is_one_physical_request(self):
+    adapter = FakeModernChatAdapter(response('{"output":"5"}'))
+    with patch.object(socket, "getaddrinfo",
+                      side_effect=AssertionError("network reached")) as dns:
+      self.assertEqual(5, self._event_poignancy(adapter))
+    events = get_telemetry()
+    self.assertEqual((1, 1), (len(adapter.calls), len(events)))
+    self.assertEqual(("event_poignancy", CHAT, M5_CHAT_MODEL), (
+      events[0].caller_id, events[0].operation, events[0].model_or_engine))
+    self.assertNotIn("gpt-3.5-turbo", [event.model_or_engine
+                                      for event in events])
+    dns.assert_not_called()
 
 
 if __name__ == "__main__":
