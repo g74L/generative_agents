@@ -24,6 +24,10 @@ from persona.prompt_template.llm_provider import (
   logical_call,
   text_completion,
 )
+from persona.prompt_template.modern_openai_provider import (
+  LLMIncompleteResponseError,
+)
+from persona.prompt_template.replay_cost_guard import ReplayCostGuardError
 
 def temp_sleep(seconds=0.1):
   time.sleep(seconds)
@@ -238,7 +242,9 @@ def GPT_request(prompt, gpt_parameter, *, caller_id=None):
                 stop=gpt_parameter["stop"],)
     return response.choices[0].text
   except (CompletionCompatCallerNotAllowedError,
-          LegacyModelInvocationDetectedError):
+          LegacyModelInvocationDetectedError,
+          LLMIncompleteResponseError,
+          ReplayCostGuardError):
     raise
   except: 
     print ("TOKEN LIMIT EXCEEDED")

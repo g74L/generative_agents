@@ -18,7 +18,7 @@ from persona.memory_structures.embedding_space import (
   reset_runtime_embedding_manifest,
   use_runtime_embedding_manifest,
 )
-from persona.prompt_template import gpt_structure
+from persona.prompt_template import gpt_structure, modern_openai_provider
 from persona.prompt_template.llm_provider import (
   CHAT,
   ERROR,
@@ -74,6 +74,7 @@ from persona.prompt_template.modern_openai_provider import (
   ModernOpenAIClientAdapter,
   ModernOpenAIProvider,
   ModernOpenAISdkUnavailableError,
+  ModernChatResponseValidationError,
   map_modern_sdk_error,
   normalize_chat_response,
   normalize_embedding_response,
@@ -331,14 +332,65 @@ class ModernSDKCompatibilitySeamTests(unittest.TestCase):
       normalize_chat_response(response)
 
   def test_31_incomplete_status_is_typed(self):
-    with self.assertRaises(LLMIncompleteResponseError):
+    with self.assertRaises(LLMIncompleteResponseError) as raised:
       normalize_chat_response(_chat(status="incomplete"))
+    self.assertEqual(
+      ("req_fixture", "gpt-3.5-turbo", "incomplete", "stop"),
+      (raised.exception.request_id, raised.exception.response_model,
+       raised.exception.response_status, raised.exception.finish_reason))
+    self.assertEqual(
+      (11, 7, 3, 2),
+      (raised.exception.input_tokens, raised.exception.output_tokens,
+       raised.exception.cached_input_tokens,
+       raised.exception.reasoning_tokens))
 
   def test_32_incomplete_finish_reason_is_typed(self):
     response = _chat()
     response["choices"][0]["finish_reason"] = "length"
-    with self.assertRaises(LLMIncompleteResponseError):
+    with self.assertRaises(LLMIncompleteResponseError) as raised:
       normalize_chat_response(response)
+    self.assertEqual("length", raised.exception.finish_reason)
+    self.assertEqual("req_fixture", raised.exception.request_id)
+    self.assertEqual("gpt-3.5-turbo", raised.exception.response_model)
+    self.assertEqual("completed", raised.exception.response_status)
+    self.assertEqual((11, 7, 3, 2), (
+      raised.exception.input_tokens, raised.exception.output_tokens,
+      raised.exception.cached_input_tokens,
+      raised.exception.reasoning_tokens))
+
+  def test_32a_content_filter_preserves_sanitized_metadata(self):
+    secret = "PRIVATE-INCOMPLETE-OUTPUT"
+    response = _chat(secret, upstream_body="PRIVATE-UPSTREAM-BODY")
+    response["choices"][0]["finish_reason"] = "content_filter"
+    with self.assertRaises(LLMIncompleteResponseError) as raised:
+      normalize_chat_response(response)
+    error = raised.exception
+    self.assertEqual(("req_fixture", "gpt-3.5-turbo", "completed",
+                      "content_filter", 11, 7, 3, 2), (
+      error.request_id, error.response_model, error.response_status,
+      error.finish_reason, error.input_tokens, error.output_tokens,
+      error.cached_input_tokens, error.reasoning_tokens))
+    self.assertNotIn(secret, repr(error))
+    self.assertNotIn("PRIVATE-UPSTREAM-BODY", repr(error))
+
+  def test_32b_incomplete_without_usage_does_not_invent_tokens(self):
+    response = _chat()
+    response["choices"][0]["finish_reason"] = "length"
+    response.pop("usage")
+    with self.assertRaises(LLMIncompleteResponseError) as raised:
+      normalize_chat_response(response)
+    self.assertEqual((None, None, None, None), (
+      raised.exception.input_tokens, raised.exception.output_tokens,
+      raised.exception.cached_input_tokens,
+      raised.exception.reasoning_tokens))
+
+  def test_32c_malformed_incomplete_metadata_fails_closed(self):
+    response = _chat("PRIVATE-OUTPUT", model={"PRIVATE": "MODEL"})
+    response["choices"][0]["finish_reason"] = "length"
+    with self.assertRaises(ModernChatResponseValidationError) as raised:
+      normalize_chat_response(response)
+    self.assertNotIn("PRIVATE-OUTPUT", repr(raised.exception))
+    self.assertNotIn("PRIVATE", repr(raised.exception))
 
   def test_33_none_output_is_typed(self):
     with self.assertRaises(LLMEmptyOutputError):
@@ -373,6 +425,27 @@ class ModernSDKCompatibilitySeamTests(unittest.TestCase):
     self.assertEqual(("gpt-3.5-turbo", "stop", "completed"),
                      (event.response_model, event.finish_reason,
                       event.response_status))
+
+  def test_38a_incomplete_telemetry_preserves_metadata_without_content(self):
+    secret_prompt = "PRIVATE-INCOMPLETE-PROMPT"
+    secret_output = "PRIVATE-INCOMPLETE-OUTPUT"
+    response = _chat(secret_output)
+    response["choices"][0]["finish_reason"] = "length"
+    with use_provider(self.provider(_Client(chat_results=[response]))):
+      with self.assertRaises(LLMIncompleteResponseError):
+        chat_completion(model="gpt-3.5-turbo", messages=[{
+          "role": "user", "content": secret_prompt}])
+    event = get_telemetry()[0]
+    self.assertEqual(ERROR, event.outcome)
+    self.assertEqual(("req_fixture", "gpt-3.5-turbo", "completed", "length"),
+                     (event.request_id, event.response_model,
+                      event.response_status, event.finish_reason))
+    self.assertEqual((11, 7, 3, 2),
+                     (event.input_tokens, event.output_tokens,
+                      event.cached_input_tokens, event.reasoning_tokens))
+    serialized = repr((event,))
+    self.assertNotIn(secret_prompt, serialized)
+    self.assertNotIn(secret_output, serialized)
 
   def test_39_embedding_telemetry_contains_request_id_and_usage(self):
     client = _Client(embedding_results=[_embedding()])
@@ -435,8 +508,7 @@ class ModernSDKCompatibilitySeamTests(unittest.TestCase):
     self.assertIs(old_config, get_llm_provider_config())
 
   def test_44_importing_seam_does_not_require_modern_openai_class(self):
-    import openai
-    self.assertFalse(hasattr(openai, "OpenAI"))
+    self.assertNotIn("openai", vars(modern_openai_provider))
     self.assertIsInstance(get_provider(), OpenAILegacyProvider)
 
   def test_45_lazy_sdk_client_is_built_with_zero_retries(self):

@@ -32,6 +32,44 @@ def get_random_alphanumeric(i=6, j=6):
   return x
 
 
+EMPTY_RESPONSE = "EMPTY_RESPONSE"
+AM_MARKER_MISSING = "AM_MARKER_MISSING"
+NON_INTEGER_PREFIX = "NON_INTEGER_PREFIX"
+MINUTES_FORMAT_PRESENT = "MINUTES_FORMAT_PRESENT"
+TEXT_BEFORE_NUMBER = "TEXT_BEFORE_NUMBER"
+PM_FORMAT_PRESENT = "PM_FORMAT_PRESENT"
+UNKNOWN_WAKE_UP_FORMAT = "UNKNOWN_WAKE_UP_FORMAT"
+
+
+def classify_wake_up_format_failure(value):
+  """Return a content-free rejection code for the historical wake parser."""
+  if not isinstance(value, str):
+    return UNKNOWN_WAKE_UP_FORMAT
+  normalized = value.strip().lower()
+  if not normalized:
+    return EMPTY_RESPONSE
+
+  try:
+    int(normalized.split("am")[0])
+    return None
+  except (TypeError, ValueError):
+    pass
+
+  if re.search(r"pm(?:\s|$)", normalized):
+    return PM_FORMAT_PRESENT
+  if re.search(r"\d\s*:\s*\d", normalized):
+    return MINUTES_FORMAT_PRESENT
+  if "am" not in normalized:
+    return AM_MARKER_MISSING
+
+  prefix = normalized.split("am", 1)[0].strip()
+  if not re.match(r"^[+-]?\d", prefix) and re.search(r"\d", prefix):
+    return TEXT_BEFORE_NUMBER
+  if prefix:
+    return NON_INTEGER_PREFIX
+  return UNKNOWN_WAKE_UP_FORMAT
+
+
 ##############################################################################
 # CHAPTER 1: Run GPT Prompt
 ##############################################################################
@@ -66,7 +104,7 @@ def run_gpt_prompt_wake_up_hour(persona, test_input=None, verbose=False):
     fs = 8
     return fs
 
-  gpt_param = {"engine": "text-davinci-002", "max_tokens": 5, 
+  gpt_param = {"engine": "text-davinci-002", "max_tokens": 20,
              "temperature": 0.8, "top_p": 1, "stream": False,
              "frequency_penalty": 0, "presence_penalty": 0, "stop": ["\n"]}
   prompt_template = "persona/prompt_template/v2/wake_up_hour_v1.txt"

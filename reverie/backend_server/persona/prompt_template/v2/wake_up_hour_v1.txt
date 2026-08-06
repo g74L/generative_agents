@@ -9,4 +9,6 @@ Variables:
 !<INPUT 0>!
 
 In general, !<INPUT 1>!
+Respond only with an integer hour followed by "am", for example: 8 am.
+Do not include minutes, introductory text, explanations, or any additional text.
 !<INPUT 2>!'s wake up hour:

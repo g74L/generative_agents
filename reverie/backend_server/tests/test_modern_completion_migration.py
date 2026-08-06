@@ -789,6 +789,7 @@ class ModernCompletionMigrationTests(unittest.TestCase):
         object(), test_input=["fixture"])[0]
     self.assertEqual(7, output)
     self.assertEqual("wake_up_hour", get_telemetry()[0].caller_id)
+    self.assertEqual(20, allowed_adapter.calls[0]["max_tokens"])
     self.assertEqual(("\n",), allowed_adapter.calls[0]["stop"])
 
     clear_telemetry()
@@ -894,6 +895,76 @@ class ModernCompletionMigrationTests(unittest.TestCase):
     self.assertNotIn(output, exported)
     for forbidden in ("messages", "parser input", "fail-safe", "transcript"):
       self.assertNotIn(forbidden, exported)
+
+  def test_64a_wake_up_failure_classifier_matches_historical_validator(self):
+    cases = (
+      ("", "EMPTY_RESPONSE", False, 8),
+      ("8am", None, True, 8),
+      ("8 am", None, True, 8),
+      ("8:00 am", "MINUTES_FORMAT_PRESENT", False, 8),
+      ("Wake up at 8 am", "TEXT_BEFORE_NUMBER", False, 8),
+      ("8", None, True, 8),
+      ("8 pm", "PM_FORMAT_PRESENT", False, 8),
+      ("13 am", None, True, 13),
+      ("8 am because...", None, True, 8),
+      (object(), "UNKNOWN_WAKE_UP_FORMAT", False, 8),
+      ("eight", "AM_MARKER_MISSING", False, 8),
+      ("eight am", "NON_INTEGER_PREFIX", False, 8),
+    )
+
+    for value, expected_code, expected_valid, expected_output in cases:
+      with self.subTest(value=repr(value)):
+        clear_telemetry()
+        observed = {}
+
+        def capture_without_provider(
+            prompt, parameters, repeat, fail_safe, validate, clean_up,
+            **kwargs):
+          observed["repeat"] = repeat
+          observed["valid"] = validate(value, prompt="private")
+          return (clean_up(value, prompt="private")
+                  if observed["valid"] else fail_safe)
+
+        with patch.object(run_gpt_prompt, "debug", False), patch.object(
+            run_gpt_prompt, "generate_prompt",
+            return_value="private historical prompt"), patch.object(
+              run_gpt_prompt, "safe_generate_response",
+              side_effect=capture_without_provider):
+          output = run_gpt_prompt.run_gpt_prompt_wake_up_hour(
+            object(), test_input=["fixture"])[0]
+
+        self.assertEqual(
+          expected_code,
+          run_gpt_prompt.classify_wake_up_format_failure(value))
+        self.assertEqual(expected_valid, observed["valid"])
+        self.assertEqual(expected_output, output)
+        self.assertEqual(5, observed["repeat"])
+        self.assertEqual((), get_telemetry())
+
+  def test_64b_wake_up_diagnostic_is_content_private(self):
+    secret = "PRIVATE-WAKE-UP-MARKER-9481"
+    value = f"{secret} 8 am"
+    classification = run_gpt_prompt.classify_wake_up_format_failure(value)
+    self.assertEqual("TEXT_BEFORE_NUMBER", classification)
+    exported = repr((classification, get_telemetry()))
+    self.assertNotIn(secret, exported)
+
+  def test_64c_wake_up_template_states_exact_output_contract(self):
+    template = (
+      BACKEND_SERVER / "persona" / "prompt_template" / "v2"
+      / "wake_up_hour_v1.txt").read_text(encoding="utf-8")
+    instruction = (
+      'Respond only with an integer hour followed by "am", '
+      'for example: 8 am.')
+    exclusions = (
+      "Do not include minutes, introductory text, explanations, "
+      "or any additional text.")
+    final_request = "!<INPUT 2>!'s wake up hour:"
+    self.assertIn(instruction, template)
+    self.assertIn(exclusions, template)
+    self.assertIn(final_request, template)
+    self.assertLess(template.index(instruction), template.index(final_request))
+    self.assertLess(template.index(exclusions), template.index(final_request))
 
   def test_65_representative_real_completion_parsers_remain_authoritative(self):
     def invoke(response, callback):

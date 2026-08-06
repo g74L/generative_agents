@@ -18,6 +18,13 @@ from persona.prompt_template.llm_provider_config import (
 )
 
 
+def _safe_optional_metadata_text(value, max_length):
+  if (isinstance(value, str) and value.strip()
+      and len(value) <= max_length):
+    return value
+  return None
+
+
 class LLMProviderError(RuntimeError):
   def __init__(self, message, request_id=None, provider_status=None):
     super().__init__(message)
@@ -67,7 +74,20 @@ class LLMServerError(LLMProviderError):
 
 
 class LLMIncompleteResponseError(LLMProviderError):
-  pass
+  def __init__(self, message, request_id=None, provider_status=None, *,
+               response_model=None, response_status=None, finish_reason=None,
+               usage=None):
+    super().__init__(message, request_id=request_id,
+                     provider_status=provider_status)
+    self.response_model = _safe_optional_metadata_text(response_model, 256)
+    self.response_status = _safe_optional_metadata_text(response_status, 128)
+    self.finish_reason = _safe_optional_metadata_text(finish_reason, 128)
+    self.usage = usage if isinstance(usage, NormalizedUsage) else None
+    self.input_tokens = getattr(self.usage, "input_tokens", None)
+    self.output_tokens = getattr(self.usage, "output_tokens", None)
+    self.cached_input_tokens = getattr(
+      self.usage, "cached_input_tokens", None)
+    self.reasoning_tokens = getattr(self.usage, "reasoning_tokens", None)
 
 
 class LLMRefusalError(LLMProviderError):
@@ -146,10 +166,7 @@ def _field(value, name, default=None):
 
 
 def _safe_request_id(value):
-  if (isinstance(value, str) and value.strip()
-      and len(value) <= 512):
-    return value
-  return None
+  return _safe_optional_metadata_text(value, 512)
 
 
 def _validated_optional_text(value, field_name, max_length=512):
@@ -280,12 +297,27 @@ def normalize_chat_response(response):
   refusal = _field(message, "refusal")
   if refusal:
     raise LLMRefusalError("Modern chat response was refused")
+  response_model = _validated_optional_text(
+    _field(response, "model"), "response model", 256)
+  request_id = _validated_optional_text(
+    (_field(response, "_request_id")
+     if _field(response, "_request_id") is not None
+     else _field(response, "request_id")), "request ID")
   status = _validated_optional_text(
     _field(response, "status"), "response status", 128)
   finish_reason = _validated_optional_text(
     _field(choice, "finish_reason"), "finish reason", 128)
+  usage = _usage_from_response(response)
+  validate_normalized_usage(usage)
   if status == "incomplete" or finish_reason in ("length", "content_filter"):
-    raise LLMIncompleteResponseError("Modern chat response is incomplete")
+    raise LLMIncompleteResponseError(
+      "Modern chat response is incomplete",
+      request_id=request_id,
+      response_model=response_model,
+      response_status=status,
+      finish_reason=finish_reason,
+      usage=usage,
+    )
   text = _field(message, "content")
   if text is None:
     raise ModernChatResponseValidationError(
@@ -298,15 +330,11 @@ def normalize_chat_response(response):
       "Modern Chat response contains empty output text")
   normalized = NormalizedTextResponse(
     text=text,
-    model=_validated_optional_text(
-      _field(response, "model"), "response model", 256),
-    request_id=_validated_optional_text(
-      (_field(response, "_request_id")
-       if _field(response, "_request_id") is not None
-       else _field(response, "request_id")), "request ID"),
+    model=response_model,
+    request_id=request_id,
     finish_reason=finish_reason,
     status=status or "completed",
-    usage=_usage_from_response(response),
+    usage=usage,
   )
   return validate_normalized_text_response(normalized)
 

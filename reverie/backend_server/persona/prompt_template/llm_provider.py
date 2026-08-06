@@ -641,6 +641,18 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any],
     if (not isinstance(error_request_id, str)
         or not error_request_id.strip() or len(error_request_id) > 512):
       error_request_id = None
+
+    def safe_error_text(name, maximum):
+      value = getattr(error, name, None)
+      if (isinstance(value, str) and value.strip()
+          and len(value) <= maximum):
+        return value
+      return None
+
+    def safe_error_token(name):
+      value = getattr(error, name, None)
+      return value if type(value) is int and value >= 0 else None
+
     event = TelemetryEvent(
       operation=operation,
       logical_call_id=state.call_id,
@@ -653,6 +665,13 @@ def _invoke(operation: str, method_name: str, kwargs: Dict[str, Any],
       provider_kind=provider_kind,
       transport_kind=transport_kind,
       request_id=error_request_id,
+      response_model=safe_error_text("response_model", 256),
+      finish_reason=safe_error_text("finish_reason", 128),
+      response_status=safe_error_text("response_status", 128),
+      input_tokens=safe_error_token("input_tokens"),
+      output_tokens=safe_error_token("output_tokens"),
+      cached_input_tokens=safe_error_token("cached_input_tokens"),
+      reasoning_tokens=safe_error_token("reasoning_tokens"),
       caller_id=replay_context.caller_id,
       cognitive_category=replay_context.cognitive_category,
       actor_id=replay_context.actor_id,

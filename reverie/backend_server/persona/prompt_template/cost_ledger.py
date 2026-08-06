@@ -29,6 +29,8 @@ USD = "USD"
 PER_MILLION_TOKENS = "PER_MILLION_TOKENS"
 MONEY_QUANTUM = Decimal("0.000000000001")
 MILLION = Decimal("1000000")
+GPT_4O_MINI_PRICING_MODEL = "gpt-4o-mini"
+GPT_4O_MINI_2024_07_18_RESPONSE_MODEL = "gpt-4o-mini-2024-07-18"
 
 
 def _validate_optional_token(value, field_name):
@@ -107,6 +109,8 @@ class PricingSnapshot:
       raise ValueError("Model and snapshot currencies must match")
 
   def pricing_for(self, model):
+    if model == GPT_4O_MINI_2024_07_18_RESPONSE_MODEL:
+      model = GPT_4O_MINI_PRICING_MODEL
     return next((item for item in self.models if item.model == model), None)
 
 

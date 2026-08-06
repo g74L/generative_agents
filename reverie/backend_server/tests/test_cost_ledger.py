@@ -162,6 +162,51 @@ class ReplayCostLedgerTests(unittest.TestCase):
     self.assertEqual("synthetic-test-v0", record.pricing_snapshot_id)
     self.assertIsNone(record.estimated_total_cost_usd)
 
+  def test_06a_exact_versioned_model_uses_canonical_pricing_only(self):
+    snapshot = PricingSnapshot(
+      snapshot_id="gpt-4o-mini-alias-test-v0",
+      schema_version=1,
+      currency="USD",
+      created_at="2026-08-06",
+      models=(ModelPricing(
+        model="gpt-4o-mini",
+        input_per_million=Decimal("0.15"),
+        cached_input_per_million=Decimal("0.075"),
+        output_per_million=Decimal("0.60")),),
+      source_note="Exact alias test fixture",
+    )
+    canonical = build_cost_ledger_records((self.event(
+      model="gpt-4o-mini", input_tokens=232, output_tokens=5,
+      cached_input_tokens=0, reasoning_tokens=0),), snapshot)[0]
+    versioned = build_cost_ledger_records((self.event(
+      model="gpt-4o-mini", response_model="gpt-4o-mini-2024-07-18",
+      input_tokens=232, output_tokens=5,
+      cached_input_tokens=0, reasoning_tokens=0),), snapshot)[0]
+    self.assertEqual(canonical.estimated_total_cost_usd,
+                     versioned.estimated_total_cost_usd)
+    self.assertEqual("gpt-4o-mini-2024-07-18", versioned.model)
+    self.assertEqual(PRICING_COMPLETE, versioned.pricing_status)
+
+  def test_06b_unallowlisted_similar_models_do_not_use_alias(self):
+    snapshot = PricingSnapshot(
+      snapshot_id="gpt-4o-mini-no-fallback-test-v0",
+      schema_version=1,
+      currency="USD",
+      created_at="2026-08-06",
+      models=(ModelPricing(
+        model="gpt-4o-mini",
+        input_per_million=Decimal("0.15"),
+        output_per_million=Decimal("0.60")),),
+      source_note="Unknown model test fixture",
+    )
+    for model in ("gpt-4o-mini-2099-01-01", "gpt-4o-mini-similar"):
+      with self.subTest(model=model):
+        record = build_cost_ledger_records((self.event(
+          model="gpt-4o-mini", response_model=model),), snapshot)[0]
+        self.assertEqual(model, record.model)
+        self.assertEqual(PRICING_UNAVAILABLE, record.pricing_status)
+        self.assertIsNone(record.estimated_total_cost_usd)
+
   def test_07_cached_input_uses_separate_price(self):
     record = self.records(self.event(
       input_tokens=100, cached_input_tokens=75, output_tokens=0))[0]
