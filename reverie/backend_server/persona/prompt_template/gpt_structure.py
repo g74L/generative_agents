@@ -83,6 +83,18 @@ def use_modern_chat_caller(caller_id, model, temperature, max_tokens, stop):
   finally:
     _modern_chat_caller_options.reset(token)
 
+
+@contextmanager
+def use_modern_chat_caller_if_active(
+    caller_id, model, temperature, max_tokens, stop):
+  """Attribute migrated callers without changing legacy direct-call mode."""
+  if get_modern_chat_runtime_config() is None:
+    yield
+  else:
+    with use_modern_chat_caller(
+        caller_id, model, temperature, max_tokens, stop):
+      yield
+
 def temp_sleep(seconds=0.1):
   time.sleep(seconds)
 
@@ -276,7 +288,16 @@ def ChatGPT_safe_generate_response_OLD(prompt,
   with logical_call():
     for i in range(repeat):
       try:
-        curr_gpt_response = ChatGPT_request(prompt).strip()
+        modern_options = _modern_chat_caller_options.get()
+        if (modern_options is not None
+            or get_modern_chat_runtime_config() is not None):
+          modern_options = modern_options or {
+            "caller_id": None, "model": None, "temperature": None,
+            "max_tokens": None, "stop": None}
+          curr_gpt_response = _modern_ChatGPT_request(
+            prompt, **modern_options).strip()
+        else:
+          curr_gpt_response = ChatGPT_request(prompt).strip()
         if func_validate(curr_gpt_response, prompt=prompt):
           return func_clean_up(curr_gpt_response, prompt=prompt)
         if verbose:
@@ -284,6 +305,8 @@ def ChatGPT_safe_generate_response_OLD(prompt,
           print (curr_gpt_response)
           print ("~~~~")
 
+      except CHAT_POLICY_ERRORS:
+        raise
       except:
         pass
   print ("FAIL SAFE TRIGGERED") 

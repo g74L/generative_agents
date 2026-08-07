@@ -886,6 +886,7 @@ def _chat_react(maze, persona, focused_event, reaction_mode, personas):
     chatting_end_time = curr_time + datetime.timedelta(minutes=inserted_act_dur)
 
   for role, p in [("init", init_persona), ("target", target_persona)]: 
+    actor_chat = [list(row) for row in convo]
     if role == "init": 
       act_address = f"<persona> {target_persona.name}"
       act_event = (p.name, "chat with", target_persona.name)
@@ -905,7 +906,7 @@ def _chat_react(maze, persona, focused_event, reaction_mode, personas):
     act_obj_event = (None, None, None)
 
     _create_react(p, inserted_act, inserted_act_dur,
-      act_address, act_event, chatting_with, convo, chatting_with_buffer, chatting_end_time,
+      act_address, act_event, chatting_with, actor_chat, chatting_with_buffer, chatting_end_time,
       act_pronunciatio, act_obj_description, act_obj_pronunciatio, 
       act_obj_event, act_start_time)
 

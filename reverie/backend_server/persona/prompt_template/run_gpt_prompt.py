@@ -1374,7 +1374,7 @@ def run_gpt_prompt_decide_to_talk(persona, target_persona, retrieved,test_input=
 
 
 
-  gpt_param = {"engine": "text-davinci-003", "max_tokens": 20, 
+  gpt_param = {"engine": "text-davinci-003", "max_tokens": 512,
                "temperature": 0, "top_p": 1, "stream": False,
                "frequency_penalty": 0, "presence_penalty": 0, "stop": None}
   prompt_template = "persona/prompt_template/v2/decide_to_talk_v2.txt"
@@ -1692,8 +1692,12 @@ def run_gpt_prompt_summarize_conversation(persona, conversation, test_input=None
   example_output = "conversing about what to eat for lunch" ########
   special_instruction = "The output must continue the sentence above by filling in the <fill in> tag. Don't start with 'this is a conversation about...' Just finish the sentence but do not miss any important details (including who are chatting)." ########
   fail_safe = get_fail_safe() ########
-  output = ChatGPT_safe_generate_response(prompt, example_output, special_instruction, 3, fail_safe,
-                                          __chat_func_validate, __chat_func_clean_up, True)
+  with use_modern_chat_caller_if_active(
+      "summarize_conversation", "gpt-4o-mini",
+      gpt_param["temperature"], None, gpt_param["stop"]):
+    output = ChatGPT_safe_generate_response(
+      prompt, example_output, special_instruction, 3, fail_safe,
+      __chat_func_validate, __chat_func_clean_up, False)
   if output != False: 
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
@@ -2095,8 +2099,12 @@ def run_gpt_prompt_chat_poignancy(persona, event_description, test_input=None, v
   example_output = "5" ########
   special_instruction = "The output should ONLY contain ONE integer value on the scale of 1 to 10." ########
   fail_safe = get_fail_safe() ########
-  output = ChatGPT_safe_generate_response(prompt, example_output, special_instruction, 3, fail_safe,
-                                          __chat_func_validate, __chat_func_clean_up, True)
+  with use_modern_chat_caller_if_active(
+      "chat_poignancy", "gpt-4o-mini", gpt_param["temperature"],
+      gpt_param["max_tokens"], gpt_param["stop"]):
+    output = ChatGPT_safe_generate_response(
+      prompt, example_output, special_instruction, 3, fail_safe,
+      __chat_func_validate, __chat_func_clean_up, False)
   if output != False: 
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
@@ -2368,8 +2376,12 @@ def run_gpt_prompt_agent_chat_summarize_relationship(persona, target_persona, st
   example_output = 'Jane Doe is working on a project' ########
   special_instruction = 'The output should be a string that responds to the question.' ########
   fail_safe = get_fail_safe() ########
-  output = ChatGPT_safe_generate_response(prompt, example_output, special_instruction, 3, fail_safe,
-                                          __chat_func_validate, __chat_func_clean_up, True)
+  with use_modern_chat_caller_if_active(
+      "agent_chat_summarize_relationship", "gpt-4o-mini",
+      gpt_param["temperature"], None, gpt_param["stop"]):
+    output = ChatGPT_safe_generate_response(
+      prompt, example_output, special_instruction, 3, fail_safe,
+      __chat_func_validate, __chat_func_clean_up, False)
   if output != False: 
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
@@ -2971,13 +2983,17 @@ def run_gpt_generate_iterative_chat_utt(maze, init_persona, target_persona, retr
   prompt = generate_prompt(prompt_input, prompt_template)
   print (prompt)
   fail_safe = get_fail_safe() 
-  output = ChatGPT_safe_generate_response_OLD(prompt, 3, fail_safe,
-                        __chat_func_validate, __chat_func_clean_up, verbose)
-  print (output)
-  
   gpt_param = {"engine": "text-davinci-003", "max_tokens": 50, 
                "temperature": 0, "top_p": 1, "stream": False,
                "frequency_penalty": 0, "presence_penalty": 0, "stop": None}
+  with use_modern_chat_caller_if_active(
+      "iterative_chat_utterance", "gpt-4o-mini",
+      gpt_param["temperature"], None, gpt_param["stop"]):
+    output = ChatGPT_safe_generate_response_OLD(
+      prompt, 3, fail_safe, __chat_func_validate,
+      __chat_func_clean_up, verbose)
+  print (output)
+
   return output, [output, prompt, gpt_param, prompt_input, fail_safe]
 
 

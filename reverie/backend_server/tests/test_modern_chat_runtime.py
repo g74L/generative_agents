@@ -1039,7 +1039,9 @@ class ModernChatRuntimeTests(unittest.TestCase):
     self.assertEqual(("event_poignancy", PLANNING),
                      (ledger.caller_id, ledger.cognitive_category))
     self.assertEqual(
-      ("pronunciatio", "act_obj_desc", "event_poignancy"),
+      ("pronunciatio", "act_obj_desc", "event_poignancy",
+       "agent_chat_summarize_relationship", "iterative_chat_utterance",
+       "summarize_conversation", "chat_poignancy"),
       M5_REPLAY_CALLER_ALLOWLIST)
 
   def test_115_pronunciatio_micro_run_is_one_call_without_legacy_detection(self):
@@ -1158,7 +1160,9 @@ class ModernChatRuntimeTests(unittest.TestCase):
       "🎨", self._pronunciatio(
         FakeModernChatAdapter(response('{"output":"🎨"}'))))
     self.assertEqual(
-      ("pronunciatio", "act_obj_desc", "event_poignancy"),
+      ("pronunciatio", "act_obj_desc", "event_poignancy",
+       "agent_chat_summarize_relationship", "iterative_chat_utterance",
+       "summarize_conversation", "chat_poignancy"),
       M5_REPLAY_CALLER_ALLOWLIST)
 
   def test_125_event_poignancy_preserves_prompt_and_privacy(self):
@@ -1210,6 +1214,186 @@ class ModernChatRuntimeTests(unittest.TestCase):
     self.assertNotIn("gpt-3.5-turbo", [event.model_or_engine
                                       for event in events])
     dns.assert_not_called()
+
+  def _summarize_relationship(self, adapter, statements="shared context"):
+    persona = SimpleNamespace(scratch=SimpleNamespace(name="Maria Lopez"))
+    target = SimpleNamespace(scratch=SimpleNamespace(name="Klaus Mueller"))
+    with self._backend_workdir(), redirect_stdout(io.StringIO()), (
+        use_modern_chat_runtime(self.config(), adapter)):
+      result = run_gpt_prompt.run_gpt_prompt_agent_chat_summarize_relationship(
+        persona, target, statements)
+      return result[0] if result is not None else None
+
+  def test_130_relationship_summary_preserves_legacy_transport_contract(self):
+    adapter = FakeModernChatAdapter(
+      response('{"output":"Klaus is discussing a shared project"}'))
+    context = LLMReplayContext(
+      cognitive_category="CONVERSATION", actor_id="Maria Lopez",
+      simulation_id="offline-relationship", simulation_step=2)
+    with use_llm_replay_context(context), patch.object(
+        gpt_structure, "chat_completion",
+        side_effect=AssertionError("legacy Chat reached")) as legacy:
+      output = self._summarize_relationship(adapter)
+    self.assertEqual("Klaus is discussing a shared project", output)
+    self.assertEqual((M5_CHAT_MODEL, 0, None, None), (
+      adapter.calls[0]["model"], adapter.calls[0]["temperature"],
+      adapter.calls[0]["max_tokens"], adapter.calls[0]["stop"]))
+    event = get_telemetry()[0]
+    self.assertEqual(
+      ("agent_chat_summarize_relationship", CHAT, M5_CHAT_MODEL,
+       "Maria Lopez", "offline-relationship", 2),
+      (event.caller_id, event.operation, event.model_or_engine,
+       event.actor_id, event.simulation_id, event.simulation_step))
+    legacy.assert_not_called()
+
+  def test_131_relationship_summary_wrong_key_keeps_three_attempts(self):
+    adapter = FakeModernChatAdapter(*[
+      response('{"wrong":"relationship"}') for _ in range(3)])
+    self.assertIsNone(self._summarize_relationship(adapter))
+    self.assertEqual(3, len(adapter.calls))
+    self.assertEqual(1, len({event.logical_call_id
+                            for event in get_telemetry()}))
+
+  def test_132_relationship_summary_invalid_json_keeps_three_attempts(self):
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response("still-invalid"), response("bad"))
+    self.assertIsNone(self._summarize_relationship(adapter))
+    self.assertEqual(3, len(adapter.calls))
+    self.assertEqual(
+      ["agent_chat_summarize_relationship"] * 3,
+      [event.caller_id for event in get_telemetry()])
+
+  def test_133_relationship_summary_invalid_then_valid_uses_existing_parser(self):
+    adapter = FakeModernChatAdapter(
+      response("not-json"),
+      response('{"output":"Klaus is discussing a shared project"}'))
+    self.assertEqual(
+      "Klaus is discussing a shared project",
+      self._summarize_relationship(adapter))
+    self.assertEqual(2, len(adapter.calls))
+
+  def _summarize_conversation(self, adapter):
+    persona = SimpleNamespace(scratch=SimpleNamespace(name="Maria Lopez"))
+    conversation = [
+      ["Maria Lopez", "synthetic first turn"],
+      ["Klaus Mueller", "synthetic second turn"],
+    ]
+    with self._backend_workdir(), redirect_stdout(io.StringIO()), (
+        use_modern_chat_runtime(self.config(), adapter)):
+      result = run_gpt_prompt.run_gpt_prompt_summarize_conversation(
+        persona, conversation)
+      return result[0] if result is not None else None
+
+  def test_134_conversation_summary_preserves_legacy_transport_contract(self):
+    adapter = FakeModernChatAdapter(response('{"output":"a shared topic"}'))
+    context = LLMReplayContext(
+      cognitive_category="CONVERSATION", actor_id="Maria Lopez",
+      simulation_id="offline-conversation-summary", simulation_step=2)
+    with use_llm_replay_context(context), patch.object(
+        gpt_structure, "chat_completion",
+        side_effect=AssertionError("legacy Chat reached")) as legacy:
+      output = self._summarize_conversation(adapter)
+    self.assertEqual("conversing about a shared topic", output)
+    self.assertEqual((M5_CHAT_MODEL, 0, None, None), (
+      adapter.calls[0]["model"], adapter.calls[0]["temperature"],
+      adapter.calls[0]["max_tokens"], adapter.calls[0]["stop"]))
+    event = get_telemetry()[0]
+    self.assertEqual(
+      ("summarize_conversation", CHAT, M5_CHAT_MODEL,
+       "Maria Lopez", "offline-conversation-summary", 2),
+      (event.caller_id, event.operation, event.model_or_engine,
+       event.actor_id, event.simulation_id, event.simulation_step))
+    legacy.assert_not_called()
+
+  def test_135_conversation_summary_invalid_then_valid_uses_existing_parser(self):
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response('{"output":"a shared topic"}'))
+    self.assertEqual(
+      "conversing about a shared topic",
+      self._summarize_conversation(adapter))
+    self.assertEqual(2, len(adapter.calls))
+
+  def test_136_conversation_summary_three_invalid_attempts_fail_clearly(self):
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response('{"wrong":"summary"}'),
+      response("still-invalid"))
+    self.assertIsNone(self._summarize_conversation(adapter))
+    self.assertEqual(3, len(adapter.calls))
+    self.assertEqual(1, len({event.logical_call_id
+                            for event in get_telemetry()}))
+
+  def test_137_conversation_summary_retries_truncated_modern_response(self):
+    adapter = FakeModernChatAdapter(
+      response('{"output":"truncated', finish_reason="length"),
+      response('{"output":"a shared topic"}'))
+    self.assertEqual(
+      "conversing about a shared topic",
+      self._summarize_conversation(adapter))
+    self.assertEqual(2, len(adapter.calls))
+
+  def _iterative_utterance(self, adapter):
+    scratch = SimpleNamespace(
+      name="Maria Lopez", curr_time=__import__("datetime").datetime(
+        2023, 2, 13, 10, 0, 0), curr_tile=(117, 49),
+      get_str_iss=lambda: "synthetic identity")
+    persona = SimpleNamespace(
+      scratch=scratch, a_mem=SimpleNamespace(seq_chat=[]))
+    target = SimpleNamespace(
+      scratch=SimpleNamespace(name="Klaus Mueller"))
+    maze = SimpleNamespace(access_tile=lambda tile: {
+      "sector": "Dorm for Oak Hill College", "arena": "common room"})
+    with self._backend_workdir(), redirect_stdout(io.StringIO()), (
+        use_modern_chat_runtime(self.config(), adapter)):
+      result = run_gpt_prompt.run_gpt_generate_iterative_chat_utt(
+        maze, persona, target, {}, "synthetic context", [])
+      return result[0]
+
+  def test_138_iterative_utterance_valid_continue_preserves_contract(self):
+    adapter = FakeModernChatAdapter(response(
+      '{"Maria Lopez":"hello","Did the conversation end?":false}'))
+    with patch.object(
+        gpt_structure, "chat_completion",
+        side_effect=AssertionError("legacy Chat reached")) as legacy:
+      output = self._iterative_utterance(adapter)
+    self.assertEqual({"utterance": "hello", "end": False}, output)
+    self.assertEqual((M5_CHAT_MODEL, 0, None, None), (
+      adapter.calls[0]["model"], adapter.calls[0]["temperature"],
+      adapter.calls[0]["max_tokens"], adapter.calls[0]["stop"]))
+    event = get_telemetry()[0]
+    self.assertEqual(("iterative_chat_utterance", CHAT),
+                     (event.caller_id, event.operation))
+    legacy.assert_not_called()
+
+  def test_139_iterative_utterance_valid_end_preserves_boolean(self):
+    adapter = FakeModernChatAdapter(response(
+      '{"Maria Lopez":"goodbye","Did the conversation end?":true}'))
+    self.assertEqual(
+      {"utterance": "goodbye", "end": True},
+      self._iterative_utterance(adapter))
+
+  def test_140_iterative_utterance_invalid_then_valid_retries(self):
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response(
+        '{"Maria Lopez":"hello","Did the conversation end?":false}'))
+    self.assertEqual(False, self._iterative_utterance(adapter)["end"])
+    self.assertEqual(2, len(adapter.calls))
+
+  def test_141_iterative_utterance_three_invalid_uses_continue_failsafe(self):
+    adapter = FakeModernChatAdapter(
+      response("bad"), response("still-bad"), response("invalid"))
+    self.assertEqual(
+      {"utterance": "...", "end": False},
+      self._iterative_utterance(adapter))
+    self.assertEqual(3, len(adapter.calls))
+    self.assertEqual(1, len({event.logical_call_id
+                            for event in get_telemetry()}))
+
+  def test_142_iterative_utterance_retries_truncated_response(self):
+    adapter = FakeModernChatAdapter(
+      response('{"Maria Lopez":"truncated', finish_reason="length"),
+      response('{"Maria Lopez":"done","Did the conversation end?":true}'))
+    self.assertTrue(self._iterative_utterance(adapter)["end"])
+    self.assertEqual(2, len(adapter.calls))
 
 
 if __name__ == "__main__":

@@ -229,6 +229,12 @@ def new_retrieve(persona, focal_points, n_count=30):
     nodes = sorted(nodes, key=lambda x: x[0])
     nodes = [i for created, i in nodes]
 
+    # A freshly bootstrapped persona can legitimately have no event/thought
+    # nodes yet. There is no context to rank in that case.
+    if not nodes:
+      retrieved[focal_pt] = []
+      continue
+
     # Calculating the component dictionaries and normalizing them.
     recency_out = extract_recency(persona, nodes)
     recency_out = normalize_dict_floats(recency_out, 0, 1)
