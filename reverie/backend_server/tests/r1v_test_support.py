@@ -1,6 +1,4 @@
 """Sanitized, versionable support for offline R1V contract tests."""
-from collections import Counter
-from contextlib import contextmanager
 import datetime
 from decimal import Decimal
 import hashlib
@@ -8,6 +6,17 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sys
+
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(BACKEND_ROOT) not in sys.path:
+  sys.path.insert(0, str(BACKEND_ROOT))
+
+from modern_smallville import (
+  PassiveVisibleMoveController,
+  install_passive_visible_moves,
+  passive_cognitive_fingerprint,
+)
 
 
 DATE_FORMAT = "%B %d, %Y, %H:%M:%S"
@@ -301,31 +310,6 @@ def _digest(value):
   return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
-def passive_cognitive_fingerprint(persona):
-  """Return content-free hashes for state passive rendering must preserve."""
-  nodes = getattr(persona.a_mem, "id_to_node", {})
-  embeddings = getattr(persona.a_mem, "embeddings", {})
-  return {
-    "associative_memory": _digest({
-      "nodes": nodes,
-      "embeddings": embeddings,
-      "event_sequence": getattr(persona.a_mem, "seq_event", ()),
-      "thought_sequence": getattr(persona.a_mem, "seq_thought", ()),
-      "chat_sequence": getattr(persona.a_mem, "seq_chat", ()),
-    }),
-    "spatial_memory": _digest(getattr(persona.s_mem, "tree", {})),
-    "scratch": _digest(vars(persona.scratch)),
-    "daily_plan": _digest(getattr(persona.scratch, "daily_plan_req", None)),
-    "schedule": _digest(getattr(persona.scratch, "f_daily_schedule", None)),
-    "action": _digest({
-      name: getattr(persona.scratch, name, None)
-      for name in (
-        "act_address", "act_description", "act_event", "act_pronunciatio",
-        "act_start_time", "act_duration", "planned_path")
-    }),
-  }
-
-
 def summarize_transitions(initial_action, initial_coordinate, observations):
   actions = [row.get("action_description") for row in observations]
   coordinates = [list(row["coordinate"]) for row in observations]
@@ -348,47 +332,3 @@ def summarize_transitions(initial_action, initial_coordinate, observations):
     "coordinate_transitions": movement_ticks,
     "first_movement_tick": movement_ticks[0] if movement_ticks else None,
   }
-
-
-class PassiveVisibleMoveController:
-  def __init__(self, server, passive_names):
-    self.server = server
-    self.passive_names = tuple(passive_names)
-    self.frame_emissions = Counter()
-    self.original_moves = {}
-
-  def install(self):
-    if len(set(self.passive_names)) != len(self.passive_names):
-      raise ValueError("passive actor names must be unique")
-    for name in self.passive_names:
-      if name not in self.server.personas or name not in self.server.personas_tile:
-        raise KeyError(name)
-      persona = self.server.personas[name]
-      self.original_moves[name] = persona.move
-
-      def passive_move(maze, personas, curr_tile, curr_time,
-                       _name=name, _persona=persona):
-        del maze, personas, curr_tile, curr_time
-        self.frame_emissions[_name] += 1
-        tile = self.server.personas_tile[_name]
-        pronunciatio = getattr(
-          _persona.scratch, "act_pronunciatio", None) or ""
-        description = getattr(
-          _persona.scratch, "act_description", None) or "idle"
-        return tuple(tile), str(pronunciatio), str(description)
-
-      persona.move = passive_move
-    return self
-
-  def restore(self):
-    for name, original in self.original_moves.items():
-      self.server.personas[name].move = original
-
-
-@contextmanager
-def install_passive_visible_moves(server, passive_names):
-  controller = PassiveVisibleMoveController(server, passive_names).install()
-  try:
-    yield controller
-  finally:
-    controller.restore()
