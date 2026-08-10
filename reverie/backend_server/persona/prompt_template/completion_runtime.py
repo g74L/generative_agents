@@ -31,6 +31,7 @@ from persona.prompt_template.modern_openai_provider import (
   LLMRateLimitError,
   LLMServerError,
   LLMTimeoutError,
+  use_legacy_completion_length_output,
 )
 
 
@@ -308,18 +309,19 @@ def run_modern_completion_compat(request):
     with logical_call():
       for attempt in range(config.application_retry_count + 1):
         try:
-          response = completion_compat(
-            model=config.model,
-            prompt=request.prompt,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            top_p=request.top_p,
-            frequency_penalty=request.frequency_penalty,
-            presence_penalty=request.presence_penalty,
-            stop=request.stop,
-            result_validator=validate_modern_chat_provider_result,
-            on_result_validation_error=discard_response_metadata,
-          )
+          with use_legacy_completion_length_output():
+            response = completion_compat(
+              model=config.model,
+              prompt=request.prompt,
+              temperature=request.temperature,
+              max_tokens=request.max_tokens,
+              top_p=request.top_p,
+              frequency_penalty=request.frequency_penalty,
+              presence_penalty=request.presence_penalty,
+              stop=request.stop,
+              result_validator=validate_modern_chat_provider_result,
+              on_result_validation_error=discard_response_metadata,
+            )
           return response["choices"][0]["message"]["content"]
         except _RETRYABLE_ERRORS:
           if attempt >= config.application_retry_count:

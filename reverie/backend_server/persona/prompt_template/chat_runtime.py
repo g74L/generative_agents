@@ -64,9 +64,9 @@ class ModernChatValidationError(ModernChatRuntimeError):
 
 
 M5_REPLAY_CALLER_ALLOWLIST = (
-  "pronunciatio", "act_obj_desc", "event_poignancy",
+  "pronunciatio", "act_obj_desc", "event_poignancy", "focal_pt",
   "agent_chat_summarize_relationship", "iterative_chat_utterance",
-  "summarize_conversation", "chat_poignancy")
+  "summarize_conversation", "chat_poignancy", "memo_on_convo")
 
 
 def validate_modern_chat_caller(caller_id):

@@ -3,6 +3,7 @@
 This module never imports ``OpenAI`` at import time.  M2 keeps application
 retries in the existing wrappers and configures modern SDK retries to zero.
 """
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 import importlib
@@ -159,6 +160,20 @@ class ProviderResponseMetadata:
   reasoning_tokens: Optional[int] = None
 
 
+_accept_legacy_completion_length_output = ContextVar(
+  "accept_legacy_completion_length_output", default=False)
+
+
+@contextmanager
+def use_legacy_completion_length_output():
+  """Preserve legacy Completion's acceptance of length-truncated text."""
+  token = _accept_legacy_completion_length_output.set(True)
+  try:
+    yield
+  finally:
+    _accept_legacy_completion_length_output.reset(token)
+
+
 def _field(value, name, default=None):
   if isinstance(value, dict):
     return value.get(name, default)
@@ -309,7 +324,12 @@ def normalize_chat_response(response):
     _field(choice, "finish_reason"), "finish reason", 128)
   usage = _usage_from_response(response)
   validate_normalized_usage(usage)
-  if status == "incomplete" or finish_reason in ("length", "content_filter"):
+  incomplete = (
+    status == "incomplete" or finish_reason in ("length", "content_filter"))
+  legacy_length_output = (
+    _accept_legacy_completion_length_output.get()
+    and status != "incomplete" and finish_reason == "length")
+  if incomplete and not legacy_length_output:
     raise LLMIncompleteResponseError(
       "Modern chat response is incomplete",
       request_id=request_id,

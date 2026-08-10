@@ -1064,8 +1064,9 @@ def run_gpt_prompt_act_obj_desc(act_game_object, act_desp, persona, verbose=Fals
     output = ChatGPT_safe_generate_response(
       prompt, example_output, special_instruction, 3, fail_safe,
       __chat_func_validate, __chat_func_clean_up, False)
-  if output != False: 
-    return output, [output, prompt, gpt_param, prompt_input, fail_safe]
+  if output is False:
+    output = fail_safe
+  return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
 
 
@@ -1958,8 +1959,9 @@ def run_gpt_prompt_event_poignancy(persona, event_description, test_input=None, 
     output = ChatGPT_safe_generate_response(
       prompt, example_output, special_instruction, 3, fail_safe,
       __chat_func_validate, __chat_func_clean_up, False)
-  if output != False: 
-    return output, [output, prompt, gpt_param, prompt_input, fail_safe]
+  if output is False:
+    output = fail_safe
+  return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
 
 
@@ -2084,7 +2086,7 @@ def run_gpt_prompt_chat_poignancy(persona, event_description, test_input=None, v
 
   def __chat_func_validate(gpt_response, prompt=""): ############
     try: 
-      __func_clean_up(gpt_response, prompt)
+      __chat_func_clean_up(gpt_response, prompt)
       return True
     except:
       return False 
@@ -2101,12 +2103,13 @@ def run_gpt_prompt_chat_poignancy(persona, event_description, test_input=None, v
   fail_safe = get_fail_safe() ########
   with use_modern_chat_caller_if_active(
       "chat_poignancy", "gpt-4o-mini", gpt_param["temperature"],
-      gpt_param["max_tokens"], gpt_param["stop"]):
+      None, gpt_param["stop"]):
     output = ChatGPT_safe_generate_response(
       prompt, example_output, special_instruction, 3, fail_safe,
       __chat_func_validate, __chat_func_clean_up, False)
-  if output != False: 
-    return output, [output, prompt, gpt_param, prompt_input, fail_safe]
+  if output is False:
+    output = fail_safe
+  return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
 
 
@@ -2179,10 +2182,14 @@ def run_gpt_prompt_focal_pt(persona, statements, n, test_input=None, verbose=Fal
   example_output = '["What should Jane do for lunch", "Does Jane like strawberry", "Who is Jane"]' ########
   special_instruction = "Output must be a list of str." ########
   fail_safe = get_fail_safe(n) ########
-  output = ChatGPT_safe_generate_response(prompt, example_output, special_instruction, 3, fail_safe,
-                                          __chat_func_validate, __chat_func_clean_up, True)
-  if output != False: 
-    return output, [output, prompt, gpt_param, prompt_input, fail_safe]
+  with use_modern_chat_caller(
+      "focal_pt", "gpt-4o-mini", gpt_param["temperature"],
+      gpt_param["max_tokens"], gpt_param["stop"]):
+    output = ChatGPT_safe_generate_response(prompt, example_output, special_instruction, 3, fail_safe,
+                                            __chat_func_validate, __chat_func_clean_up, True)
+  if output is False:
+    output = fail_safe
+  return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
 
 
@@ -2811,13 +2818,16 @@ def run_gpt_prompt_memo_on_convo(persona, all_utt, test_input=None, verbose=Fals
   example_output = 'Jane Doe was interesting to talk to.' ########
   special_instruction = 'The output should ONLY contain a string that summarizes anything interesting that the agent may have noticed' ########
   fail_safe = get_fail_safe() ########
-  output = ChatGPT_safe_generate_response(prompt, example_output, special_instruction, 3, fail_safe,
-                                          __chat_func_validate, __chat_func_clean_up, True)
-  if output != False: 
+  with use_modern_chat_caller_if_active(
+      "memo_on_convo", "gpt-4o-mini", gpt_param["temperature"],
+      gpt_param["max_tokens"], gpt_param["stop"]):
+    output = ChatGPT_safe_generate_response(prompt, example_output, special_instruction, 3, fail_safe,
+                                            __chat_func_validate, __chat_func_clean_up, True)
+  if output != False:
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
 
-  gpt_param = {"engine": "text-davinci-003", "max_tokens": 50, 
+  gpt_param = {"engine": "text-davinci-003", "max_tokens": 50,
                "temperature": 0, "top_p": 1, "stream": False,
                "frequency_penalty": 0, "presence_penalty": 0, "stop": None}
   prompt_template = "persona/prompt_template/v2/memo_on_convo_v1.txt"

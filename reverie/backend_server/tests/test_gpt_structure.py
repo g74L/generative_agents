@@ -198,7 +198,7 @@ class GPTStructureProviderTests(unittest.TestCase):
       "ChatGPT_request": ["prompt"],
       "GPT4_request": ["prompt"],
       "GPT_request": ["prompt", "gpt_parameter", "caller_id"],
-      "get_embedding": ["text", "model"],
+      "get_embedding": ["text", "model", "caller_id"],
       "safe_generate_response": ["prompt", "gpt_parameter", "repeat",
                                   "fail_safe_response", "func_validate",
                                   "func_clean_up", "verbose", "caller_id"],

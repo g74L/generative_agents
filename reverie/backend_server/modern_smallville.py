@@ -100,6 +100,26 @@ R1M3C_NATURAL_VERDICT = (
 R1M3C_FUNCTIONAL_VERDICT = (
   "R1M3_C_SOCIAL_PIPELINE_FUNCTIONAL_MODEL_END_NOT_OBSERVED")
 R1M3C_MEMORY_BLOCKED_VERDICT = "R1M3_C_CONVERSATION_MEMORY_BLOCKED"
+R1CLI_A2_A_READY_VERDICT = (
+  "R1CLI_A2_A_STRUCTURAL_RESUME_READY_FOR_PROCESS_BOUNDARY_REVIEW")
+R1CLI_A2_A_BLOCKED_VERDICT = "R1CLI_A2_A_BLOCKED"
+R1CLI_A2_B_READY_VERDICT = (
+  "R1CLI_A2_B_CAUSAL_SOCIAL_MEMORY_READY_FOR_LIVE_PROCESS_BOUNDARY_REVIEW")
+R1CLI_A2_B_BLOCKED_VERDICT = "R1CLI_A2_B_CAUSAL_SOCIAL_MEMORY_BLOCKED"
+R1CLI_A2_B_PATH_NOT_REACHED_VERDICT = (
+  "R1CLI_A2_B_CAUSAL_SOCIAL_PATH_NOT_REACHED")
+
+RESUME_SCRATCH_FIELDS = (
+  "curr_time", "curr_tile", "daily_plan_req", "daily_req",
+  "f_daily_schedule", "f_daily_schedule_hourly_org",
+  "act_address", "act_start_time", "act_duration", "act_description",
+  "act_event", "act_obj_description", "act_obj_pronunciatio",
+  "act_obj_event", "chatting_with", "chat", "chatting_with_buffer",
+  "chatting_end_time", "act_path_set", "planned_path",
+  "importance_trigger_max", "importance_trigger_curr", "importance_ele_n",
+  "thought_count", "name", "first_name", "last_name", "age", "innate",
+  "learned", "currently", "lifestyle", "living_area",
+)
 
 
 def _classify_r1m3c_conversation(
@@ -220,6 +240,49 @@ class ModernRunConfig:
 
 
 @dataclass(frozen=True)
+class ModernResumeConfig:
+  source_run: Path
+  run_name: str
+  ticks: int = 5
+  cost_ceiling_usd: Decimal = DEFAULT_COST_CEILING
+  observe_causal_social_memory: bool = False
+
+  def __post_init__(self):
+    if not isinstance(self.source_run, Path):
+      raise ModernRunConfigurationError("resume source must be a Path")
+    if type(self.ticks) is not int or self.ticks <= 0:
+      raise ModernRunConfigurationError("ticks must be greater than zero")
+    if (not isinstance(self.cost_ceiling_usd, Decimal)
+        or not self.cost_ceiling_usd.is_finite()
+        or self.cost_ceiling_usd <= 0):
+      raise ModernRunConfigurationError(
+        "cost ceiling must be a finite Decimal greater than zero")
+    if not isinstance(self.run_name, str) or not self.run_name.strip():
+      raise ModernRunConfigurationError("run name must not be empty")
+    if not SAFE_NAME.fullmatch(self.run_name):
+      raise ModernRunConfigurationError(
+        "run name may contain only letters, digits, dot, underscore and dash")
+    if type(self.observe_causal_social_memory) is not bool:
+      raise ModernRunConfigurationError(
+        "observe_causal_social_memory must be a boolean")
+
+
+@dataclass(frozen=True)
+class _ResumeContext:
+  request: ModernResumeConfig
+  source_run: Path
+  simulation_root: Path
+  source_meta: dict[str, Any]
+  cognitive_actors: tuple[str, ...]
+  passive_actors: tuple[str, ...]
+  movement_hashes: dict[str, str]
+  environment_hashes: dict[str, str]
+  actor_state: dict[str, dict[str, Any]]
+  embedding_audits: tuple[Any, ...]
+  causal_social_memory: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class ModernRunResult:
   verdict: str
   run_directory: Path
@@ -297,6 +360,331 @@ def _tree_sha256(path: Path) -> str:
     digest.update(_file_sha256(child).encode("ascii"))
     digest.update(b"\n")
   return digest.hexdigest()
+
+
+def _state_sha256(value: Any) -> str:
+  payload = json.dumps(
+    _normalize(value), sort_keys=True, separators=(",", ":"),
+    ensure_ascii=False)
+  return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _scratch_resume_state(scratch_or_mapping) -> dict[str, Any]:
+  if isinstance(scratch_or_mapping, dict):
+    get_value = scratch_or_mapping.get
+  else:
+    get_value = lambda field: getattr(scratch_or_mapping, field, None)
+  return {
+    field: _normalize(get_value(field)) for field in RESUME_SCRATCH_FIELDS}
+
+
+def _canonical_node_ids(node_ids):
+  def key(node_id):
+    match = re.fullmatch(r"node_(\d+)", node_id)
+    return (0, int(match.group(1))) if match else (1, node_id)
+  return sorted(node_ids, key=key)
+
+
+def _node_field(node, field, default=None):
+  if isinstance(node, dict):
+    return node.get(field, default)
+  return getattr(node, field, default)
+
+
+def _content_hash(value) -> str:
+  return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+
+def _node_created_timestamp(value):
+  if isinstance(value, dt.datetime):
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+  return str(value) if value is not None else None
+
+
+def _social_memory_actor_snapshot(actor_name, nodes) -> dict[str, Any]:
+  """Return content-free Chat -> Event/Thought lineage metadata."""
+  chat_ids = {
+    node_id for node_id, node in nodes.items()
+    if _node_field(node, "type") == "chat"}
+  chats = []
+  derived_events = []
+  derived_thoughts = []
+  last_accessed_missing = False
+  for node_id in _canonical_node_ids(nodes):
+    node = nodes[node_id]
+    node_type = _node_field(node, "type")
+    if node_type not in ("chat", "event", "thought"):
+      continue
+    filling = _node_field(node, "filling") or []
+    if not isinstance(filling, (tuple, list)):
+      filling = []
+    lineage = [
+      item for item in filling
+      if isinstance(item, str) and item in chat_ids]
+    if node_type != "chat" and not lineage:
+      continue
+    created = _node_created_timestamp(_node_field(node, "created"))
+    metadata = {
+      "actor": actor_name,
+      "node_id": node_id,
+      "node_ref": f"{actor_name}::{node_id}",
+      "node_type": node_type,
+      "created": created,
+      "embedding_key_hash": _content_hash(
+        _node_field(node, "embedding_key", "")),
+    }
+    if node_type == "chat":
+      metadata.update({
+        "participant": _normalize(_node_field(node, "object")),
+        "filling_present": bool(filling),
+      })
+      chats.append(metadata)
+    else:
+      metadata.update({
+        "source_chat_node_ids": _canonical_node_ids(lineage),
+        "lineage_field": "filling" if node_type == "event" else "evidence",
+      })
+      (derived_events if node_type == "event"
+       else derived_thoughts).append(metadata)
+    if ((isinstance(node, dict) and "last_accessed" not in node)
+        or (not isinstance(node, dict)
+            and not hasattr(node, "last_accessed"))):
+      last_accessed_missing = True
+  return {
+    "chat_nodes": chats,
+    "derived_event_nodes": derived_events,
+    "derived_thought_nodes": derived_thoughts,
+    "chat_node_ids": [item["node_id"] for item in chats],
+    "derived_node_ids": [
+      item["node_id"] for item in derived_events + derived_thoughts],
+    "last_accessed_not_serialized": last_accessed_missing,
+  }
+
+
+def _social_memory_snapshot(actor_nodes) -> dict[str, Any]:
+  actors = {
+    name: _social_memory_actor_snapshot(name, nodes)
+    for name, nodes in actor_nodes.items() if name in R1M3C_ACTORS}
+  expected_participant = {
+    R1M3C_ACTORS[0]: R1M3C_ACTORS[1],
+    R1M3C_ACTORS[1]: R1M3C_ACTORS[0],
+  }
+
+  def has_chat_event_lineage(actor_name):
+    actor = actors.get(actor_name, {})
+    chat_ids = {
+      item["node_id"] for item in actor.get("chat_nodes", ())
+      if item.get("participant") == expected_participant[actor_name]}
+    return bool(chat_ids) and any(
+      chat_ids.intersection(item.get("source_chat_node_ids", ()))
+      for item in actor.get("derived_event_nodes", ()))
+
+  return {
+    "actors": actors,
+    "chat_node_ids": _canonical_node_ids({
+      node_id for actor in actors.values()
+      for node_id in actor["chat_node_ids"]}),
+    "derived_node_ids": _canonical_node_ids({
+      node_id for actor in actors.values()
+      for node_id in actor["derived_node_ids"]}),
+    "chat_node_refs": sorted(
+      item["node_ref"] for actor in actors.values()
+      for item in actor["chat_nodes"]),
+    "derived_node_refs": sorted(
+      item["node_ref"] for actor in actors.values()
+      for item in (actor["derived_event_nodes"]
+                   + actor["derived_thought_nodes"])),
+    "bilateral_chat_lineage_present": (
+      set(actors) == set(R1M3C_ACTORS)
+      and all(has_chat_event_lineage(name) for name in R1M3C_ACTORS)),
+    "last_accessed_persistence_gap_detected": any(
+      actor["last_accessed_not_serialized"] for actor in actors.values()),
+  }
+
+
+def _compare_social_memory_hydration(pre_resume, hydrated):
+  actor_checks = {}
+  for name, before in pre_resume.get("actors", {}).items():
+    after = hydrated.get("actors", {}).get(name, {})
+    checks = {
+      "chat_nodes_preserved": (
+        before.get("chat_nodes") == after.get("chat_nodes")),
+      "derived_event_nodes_preserved": (
+        before.get("derived_event_nodes")
+        == after.get("derived_event_nodes")),
+      "derived_thought_nodes_preserved": (
+        before.get("derived_thought_nodes")
+        == after.get("derived_thought_nodes")),
+    }
+    checks["derived_nodes_preserved"] = all((
+      checks["derived_event_nodes_preserved"],
+      checks["derived_thought_nodes_preserved"]))
+    checks["lineage_preserved"] = all(checks.values())
+    actor_checks[name] = checks
+  raw_persisted = bool(actor_checks) and all(
+    item["chat_nodes_preserved"] for item in actor_checks.values())
+  derived_persisted = bool(actor_checks) and all(
+    item["derived_nodes_preserved"] for item in actor_checks.values())
+  lineage_preserved = bool(actor_checks) and all(
+    item["lineage_preserved"] for item in actor_checks.values())
+  return {
+    "actors": actor_checks,
+    "chat_nodes_preserved": raw_persisted,
+    "derived_nodes_preserved": derived_persisted,
+    "lineage_preserved": lineage_preserved,
+    "raw_social_memory_persisted": raw_persisted,
+    "derived_social_memory_persisted": derived_persisted,
+  }
+
+
+def _classify_causal_social_memory(
+    *, raw_social_memory_persisted, derived_social_memory_persisted,
+    lineage_preserved_after_hydration, pre_resume_derived_node_ids,
+    retrieved_node_ids, consumed_node_ids):
+  expected = set(pre_resume_derived_node_ids)
+  retrieved = expected & set(retrieved_node_ids)
+  consumed = retrieved & set(consumed_node_ids)
+  derived_retrieved = bool(retrieved)
+  derived_consumed = bool(consumed)
+  causal = all((
+    raw_social_memory_persisted,
+    derived_social_memory_persisted,
+    lineage_preserved_after_hydration,
+    derived_retrieved,
+    derived_consumed,
+  ))
+  return {
+    "raw_social_memory_persisted": bool(raw_social_memory_persisted),
+    "derived_social_memory_persisted": bool(
+      derived_social_memory_persisted),
+    "lineage_preserved_after_hydration": bool(
+      lineage_preserved_after_hydration),
+    "derived_social_memory_retrieved": derived_retrieved,
+    "derived_social_memory_consumed": derived_consumed,
+    "retrieved_pre_resume_derived_social_node_refs": sorted(retrieved),
+    "consumed_pre_resume_derived_social_node_refs": sorted(consumed),
+    "retrieved_pre_resume_derived_social_node_ids": _canonical_node_ids(
+      {item.split("::", 1)[-1] for item in retrieved}),
+    "consumed_pre_resume_derived_social_node_ids": _canonical_node_ids(
+      {item.split("::", 1)[-1] for item in consumed}),
+    "social_memory_causally_reused": causal,
+    "causal_link_verified": causal,
+  }
+
+
+def _persisted_actor_resume_metadata(
+    simulation_root: Path, actor_name: str) -> dict[str, Any]:
+  memory_root = (simulation_root / "personas" / actor_name
+                 / "bootstrap_memory")
+  required = (
+    memory_root / "scratch.json",
+    memory_root / "spatial_memory.json",
+    memory_root / "associative_memory" / "nodes.json",
+    memory_root / "associative_memory" / "kw_strength.json",
+    memory_root / "associative_memory" / "embeddings.json",
+  )
+  if any(not path.is_file() for path in required):
+    raise ModernRunConfigurationError(
+      f"Persona persistence is incomplete: actor={actor_name}")
+  try:
+    scratch = _read_json(required[0])
+    spatial = _read_json(required[1])
+    nodes = _read_json(required[2])
+    embeddings = _read_json(required[4])
+  except (OSError, ValueError, TypeError) as error:
+    raise ModernRunConfigurationError(
+      f"Persona persistence is invalid: actor={actor_name}") from error
+  if not all(isinstance(value, dict)
+             for value in (scratch, spatial, nodes, embeddings)):
+    raise ModernRunConfigurationError(
+      f"Persona persistence has an invalid shape: actor={actor_name}")
+  raw_node_ids = list(nodes)
+  node_ids = _canonical_node_ids(raw_node_ids)
+  references = {
+    node.get("embedding_key") for node in nodes.values()
+    if isinstance(node, dict) and node.get("embedding_key") is not None}
+  node_types = Counter(
+    node.get("type") for node in nodes.values() if isinstance(node, dict))
+  return {
+    "identity_aligned": scratch.get("name") == actor_name,
+    "memory_node_count": len(nodes),
+    "event_count": node_types["event"],
+    "thought_count": node_types["thought"],
+    "chat_count": node_types["chat"],
+    "embedding_count": len(embeddings),
+    "node_ids": node_ids,
+    "node_ids_valid": node_ids == [
+      f"node_{index}" for index in range(1, len(node_ids) + 1)],
+    "node_ids_unique": len(raw_node_ids) == len(set(raw_node_ids)),
+    "embedding_references_valid": references.issubset(set(embeddings)),
+    "orphan_embedding_count": len(set(embeddings) - references),
+    "scratch_state_hash": _state_sha256(_scratch_resume_state(scratch)),
+    "embedding_state_hash": _state_sha256(embeddings),
+    "spatial_memory_hash": _state_sha256(spatial),
+    "persona_files_hash": _tree_sha256(memory_root),
+    "scratch_curr_time": scratch.get("curr_time"),
+  }
+
+
+def _loaded_actor_resume_metadata(persona) -> dict[str, Any]:
+  nodes = persona.a_mem.id_to_node
+  raw_node_ids = list(nodes)
+  node_ids = _canonical_node_ids(raw_node_ids)
+  embeddings = persona.a_mem.embeddings
+  references = {
+    node.embedding_key for node in nodes.values()
+    if getattr(node, "embedding_key", None) is not None}
+  return {
+    "identity_aligned": persona.name == persona.scratch.name,
+    "memory_node_count": len(nodes),
+    "event_count": len(persona.a_mem.seq_event),
+    "thought_count": len(persona.a_mem.seq_thought),
+    "chat_count": len(persona.a_mem.seq_chat),
+    "embedding_count": len(embeddings),
+    "node_ids": node_ids,
+    "node_ids_valid": node_ids == [
+      f"node_{index}" for index in range(1, len(node_ids) + 1)],
+    "node_ids_unique": len(raw_node_ids) == len(set(raw_node_ids)),
+    "embedding_references_valid": references.issubset(set(embeddings)),
+    "orphan_embedding_count": len(set(embeddings) - references),
+    "scratch_state_hash": _state_sha256(
+      _scratch_resume_state(persona.scratch)),
+    "embedding_state_hash": _state_sha256(embeddings),
+    "spatial_memory_hash": _state_sha256(persona.s_mem.tree),
+  }
+
+
+def _persisted_social_memory_snapshot(simulation_root: Path):
+  actor_nodes = {}
+  for name in R1M3C_ACTORS:
+    nodes_path = (simulation_root / "personas" / name / "bootstrap_memory"
+                  / "associative_memory" / "nodes.json")
+    if nodes_path.is_file():
+      nodes = _read_json(nodes_path)
+      if isinstance(nodes, dict):
+        actor_nodes[name] = nodes
+  return _social_memory_snapshot(actor_nodes)
+
+
+def _loaded_social_memory_snapshot(personas):
+  return _social_memory_snapshot({
+    name: personas[name].a_mem.id_to_node
+    for name in R1M3C_ACTORS if name in personas})
+
+
+def _resume_actor_hydration_checks(persisted, loaded, copied_hash):
+  compared = (
+    "identity_aligned", "memory_node_count", "event_count",
+    "thought_count", "chat_count", "embedding_count", "node_ids",
+    "node_ids_valid", "node_ids_unique", "embedding_references_valid",
+    "orphan_embedding_count", "scratch_state_hash",
+    "embedding_state_hash", "spatial_memory_hash",
+  )
+  checks = {field: persisted[field] == loaded[field] for field in compared}
+  checks["persona_files_preserved"] = (
+    persisted["persona_files_hash"] == copied_hash)
+  checks["all_checks_passed"] = all(checks.values())
+  return checks
 
 
 def _bootstrap_isolated_temporal_source(
@@ -765,7 +1153,8 @@ def _validate_controlled_proximity(server) -> dict[str, Any]:
 class _ConversationObserver:
   """Content-free observation of the existing Stanford interaction path."""
 
-  def __init__(self, server, execution_state, simulation_id):
+  def __init__(self, server, execution_state, simulation_id,
+               pre_resume_derived_node_refs=(), pre_resume_chat_node_refs=()):
     self.server = server
     self.execution_state = execution_state
     self.simulation_id = simulation_id
@@ -773,7 +1162,14 @@ class _ConversationObserver:
     self.reactions = []
     self.conversations = []
     self.turn_results = []
+    self.retrieval_events = []
+    self.relationship_events = []
+    self.last_chat_events = []
+    self.pre_resume_derived_node_refs = set(pre_resume_derived_node_refs)
+    self.pre_resume_chat_node_refs = set(pre_resume_chat_node_refs)
+    self._retrieval_result_events = {}
     self._original_perceive = {}
+    self._original_last_chat = {}
     self._originals = {}
 
   @contextmanager
@@ -848,12 +1244,56 @@ class _ConversationObserver:
 
     def actor_retrieve(persona, *args, **kwargs):
       with self._actor_context(persona.name):
-        return self._originals["new_retrieve"](persona, *args, **kwargs)
+        result = self._originals["new_retrieve"](persona, *args, **kwargs)
+      nodes = {
+        node.node_id: node for values in result.values() for node in values}
+      node_ids = _canonical_node_ids(nodes)
+      node_refs = [f"{persona.name}::{node_id}" for node_id in node_ids]
+      focal_points = args[0] if args else kwargs.get("focal_points", ())
+      event = {
+        "actor": persona.name,
+        "simulation_step": self.execution_state["tick"],
+        "retrieval_context": "new_retrieve",
+        "focal_point_hashes": [
+          _content_hash(item) for item in focal_points],
+        "retrieved_node_ids": node_ids,
+        "retrieved_node_types": [nodes[node_id].type for node_id in node_ids],
+        "retrieved_pre_resume_derived_social_node_ids": [
+          node_id for node_id, node_ref in zip(node_ids, node_refs)
+          if node_ref in self.pre_resume_derived_node_refs],
+        "retrieved_pre_resume_derived_social_node_refs": [
+          node_ref for node_ref in node_refs
+          if node_ref in self.pre_resume_derived_node_refs],
+      }
+      self.retrieval_events.append(event)
+      self._retrieval_result_events[id(result)] = len(self.retrieval_events) - 1
+      return result
 
-    def actor_relationship(init_persona, *args, **kwargs):
+    def actor_relationship(init_persona, target_persona, retrieved):
+      nodes = {
+        node.node_id: node for values in retrieved.values() for node in values}
+      node_ids = _canonical_node_ids(nodes)
+      node_refs = [
+        f"{init_persona.name}::{node_id}" for node_id in node_ids]
+      event = {
+        "actor": init_persona.name,
+        "target_actor": target_persona.name,
+        "simulation_step": self.execution_state["tick"],
+        "input_node_ids": node_ids,
+        "input_node_types": [nodes[node_id].type for node_id in node_ids],
+        "pre_resume_derived_social_node_ids_present": [
+          node_id for node_id, node_ref in zip(node_ids, node_refs)
+          if node_ref in self.pre_resume_derived_node_refs],
+        "pre_resume_derived_social_node_refs_present": [
+          node_ref for node_ref in node_refs
+          if node_ref in self.pre_resume_derived_node_refs],
+        "source_retrieval_event_index": self._retrieval_result_events.get(
+          id(retrieved)),
+      }
+      self.relationship_events.append(event)
       with self._actor_context(init_persona.name):
         return self._originals["relationship"](
-          init_persona, *args, **kwargs)
+          init_persona, target_persona, retrieved)
 
     def actor_utterance(maze, init_persona, target_persona, retrieved,
                         curr_chat):
@@ -873,6 +1313,25 @@ class _ConversationObserver:
     for name, persona in self.server.personas.items():
       original = persona.perceive
       self._original_perceive[name] = original
+      original_last_chat = persona.a_mem.get_last_chat
+      self._original_last_chat[name] = original_last_chat
+
+      def observed_last_chat(target_name, *args, _name=name,
+                             _original=original_last_chat, **kwargs):
+        node = _original(target_name, *args, **kwargs)
+        node_id = getattr(node, "node_id", None) if node else None
+        node_ref = f"{_name}::{node_id}" if node_id else None
+        self.last_chat_events.append({
+          "actor": _name, "target_actor": target_name,
+          "simulation_step": self.execution_state["tick"],
+          "chat_node_id": node_id,
+          "chat_node_type": getattr(node, "type", None) if node else None,
+          "pre_resume_chat_node_observed": (
+            node_ref in self.pre_resume_chat_node_refs),
+        })
+        return node
+
+      persona.a_mem.get_last_chat = observed_last_chat
 
       def observed_perceive(maze, _name=name, _persona=persona,
                            _original=original):
@@ -913,16 +1372,149 @@ class _ConversationObserver:
       converse_module.generate_one_utterance = self._originals["utterance"]
     for name, original in self._original_perceive.items():
       self.server.personas[name].perceive = original
+    for name, original in self._original_last_chat.items():
+      self.server.personas[name].a_mem.get_last_chat = original
 
 
 @contextmanager
-def _observe_conversations(server, execution_state, simulation_id):
+def _observe_conversations(
+    server, execution_state, simulation_id,
+    pre_resume_derived_node_refs=(), pre_resume_chat_node_refs=()):
   observer = _ConversationObserver(
-    server, execution_state, simulation_id).install()
+    server, execution_state, simulation_id,
+    pre_resume_derived_node_refs,
+    pre_resume_chat_node_refs).install()
   try:
     yield observer
   finally:
     observer.restore()
+
+
+def _indexed_history_hashes(root: Path, first: int, stop: int):
+  expected = tuple(f"{index}.json" for index in range(first, stop))
+  actual = tuple(sorted(
+    (path.name for path in root.glob("*.json")),
+    key=lambda name: int(Path(name).stem)
+    if Path(name).stem.isdigit() else -1))
+  if actual != expected:
+    raise ModernRunConfigurationError(
+      f"persisted history is inconsistent: directory={root.name}")
+  return {name: _file_sha256(root / name) for name in expected}
+
+
+def _prepare_resume_context(
+    config: ModernResumeConfig, root: Path) -> _ResumeContext:
+  source_run = config.source_run.resolve()
+  if source_run.parent != root or not source_run.is_dir():
+    raise ModernRunConfigurationError(
+      "resume source must be an existing run inside the runtime root")
+  if not SAFE_NAME.fullmatch(source_run.name):
+    raise ModernRunConfigurationError("resume source name is invalid")
+  report_path = source_run / "report.json"
+  status_path = source_run / "status.json"
+  if not report_path.is_file() or not status_path.is_file():
+    raise ModernRunConfigurationError(
+      "resume source is missing its report or status")
+  try:
+    report = _read_json(report_path)
+    status = _read_json(status_path)
+  except (OSError, ValueError, TypeError) as error:
+    raise ModernRunConfigurationError(
+      "resume source report or status is corrupt") from error
+  if status.get("state") != "PASSED":
+    raise ModernRunConfigurationError("resume source did not finish successfully")
+  source_result = report.get("result", {})
+  source_config = report.get("config", {})
+  actor_policy = report.get("actor_policy", {})
+  if (source_config.get("run_name") != source_run.name
+      or not source_result.get("save_passed")
+      or not source_result.get("reload_passed")):
+    raise ModernRunConfigurationError(
+      "resume source does not contain a validated persisted run")
+  cognitive_actors = tuple(actor_policy.get("cognitive", ()))
+  passive_actors = tuple(actor_policy.get("passive", ()))
+  if (tuple(actor_policy.get("visible", ())) != VISIBLE_ACTORS
+      or not cognitive_actors
+      or set(cognitive_actors) | set(passive_actors) != set(VISIBLE_ACTORS)
+      or set(cognitive_actors) & set(passive_actors)):
+    raise ModernRunConfigurationError(
+      "resume source actor registry is incompatible")
+
+  simulation_root = source_run / "fixture" / "storage" / source_run.name
+  if not simulation_root.is_dir():
+    raise ModernRunConfigurationError(
+      "resume source persisted simulation is missing")
+  meta_path = simulation_root / "reverie" / "meta.json"
+  if not meta_path.is_file():
+    raise ModernRunConfigurationError("resume source meta is missing")
+  try:
+    meta = _read_json(meta_path)
+    persisted_time = dt.datetime.strptime(meta.get("curr_time", ""), DATE_FORMAT)
+  except (OSError, ValueError, TypeError) as error:
+    raise ModernRunConfigurationError("resume source meta is corrupt") from error
+  step = meta.get("step")
+  if type(step) is not int or step <= 0:
+    raise ModernRunConfigurationError(
+      "resume source step must be a positive integer")
+  if meta.get("sec_per_step") != 10:
+    raise ModernRunConfigurationError(
+      "resume source tick duration is incompatible")
+  if tuple(meta.get("persona_names", ())) != VISIBLE_ACTORS:
+    raise ModernRunConfigurationError(
+      "resume source actor registry is incompatible")
+  if (source_result.get("final_step") != step
+      or source_result.get("final_time") != persisted_time.strftime(DATE_FORMAT)):
+    raise ModernRunConfigurationError(
+      "resume source report does not match persisted step/time")
+
+  movement_hashes = _indexed_history_hashes(
+    simulation_root / "movement", 0, step)
+  environment_hashes = _indexed_history_hashes(
+    simulation_root / "environment", 0, step + 1)
+  actor_state = {
+    name: _persisted_actor_resume_metadata(simulation_root, name)
+    for name in cognitive_actors}
+  actor_state_issues = {
+    name: tuple(key for key, passed in {
+      "identity_aligned": state["identity_aligned"],
+      "node_ids_valid": state["node_ids_valid"],
+      "node_ids_unique": state["node_ids_unique"],
+      "embedding_references_valid": state["embedding_references_valid"],
+      "no_orphan_embeddings": state["orphan_embedding_count"] == 0,
+    }.items() if not passed)
+    for name, state in actor_state.items()}
+  actor_state_issues = {
+    name: issues for name, issues in actor_state_issues.items() if issues}
+  if actor_state_issues:
+    raise ModernRunConfigurationError(
+      "resume source cognitive state is inconsistent: "
+      + repr(actor_state_issues))
+  embedding_audits = tuple(_embedding_audits(
+    simulation_root, VISIBLE_ACTORS).values())
+  if any(not all((
+      audit.classification == controlled_replay.MODERN_COMPATIBLE,
+      audit.manifest_present,
+      audit.model == TEXT_EMBEDDING_3_SMALL_1536_MANIFEST.model,
+      audit.dimensions == TEXT_EMBEDDING_3_SMALL_1536_MANIFEST.dimensions,
+      not audit.internal_mismatch,
+      audit.orphan_embedding_count == 0,
+  )) for audit in embedding_audits):
+    raise ModernRunConfigurationError(
+      "resume source embedding store is incompatible")
+  causal_social_memory = _persisted_social_memory_snapshot(simulation_root)
+  if config.observe_causal_social_memory:
+    if (not set(R1M3C_ACTORS).issubset(cognitive_actors)
+        or not causal_social_memory["bilateral_chat_lineage_present"]):
+      raise ModernRunConfigurationError(
+        "causal social resume source lacks bilateral Chat -> Event lineage")
+  return _ResumeContext(
+    request=config, source_run=source_run,
+    simulation_root=simulation_root, source_meta=meta,
+    cognitive_actors=cognitive_actors, passive_actors=passive_actors,
+    movement_hashes=movement_hashes,
+    environment_hashes=environment_hashes, actor_state=actor_state,
+    embedding_audits=embedding_audits,
+    causal_social_memory=causal_social_memory)
 
 
 def run_modern_smallville(
@@ -931,9 +1523,38 @@ def run_modern_smallville(
   """Run one isolated modern Smallville and return a compact typed result."""
   if not isinstance(config, ModernRunConfig):
     raise TypeError("config must be ModernRunConfig")
+  return _execute_modern_smallville(
+    config, adapter=adapter, runtime_root=runtime_root)
+
+
+def run_modern_smallville_resume(
+    config: ModernResumeConfig, *, adapter=None,
+    runtime_root: Optional[Path] = None) -> ModernRunResult:
+  """Continue a validated persisted run in a new isolated simulation copy."""
+  if not isinstance(config, ModernResumeConfig):
+    raise TypeError("config must be ModernResumeConfig")
   root = Path(runtime_root or RUNTIME_ROOT).resolve()
-  source = (SOURCE_ROOT / config.source_simulation).resolve()
-  if not source.is_dir() or source.parent != SOURCE_ROOT.resolve():
+  resume = _prepare_resume_context(config, root)
+  run_config = ModernRunConfig(
+    source_simulation=resume.source_run.name,
+    run_name=config.run_name, ticks=config.ticks, tick_seconds=10,
+    cognitive_actors=resume.cognitive_actors,
+    passive_actors=resume.passive_actors,
+    cost_ceiling_usd=config.cost_ceiling_usd,
+    controlled_proximity=False)
+  return _execute_modern_smallville(
+    run_config, adapter=adapter, runtime_root=root, resume=resume)
+
+
+def _execute_modern_smallville(
+    config: ModernRunConfig, *, adapter=None,
+    runtime_root: Optional[Path] = None,
+    resume: Optional[_ResumeContext] = None) -> ModernRunResult:
+  root = Path(runtime_root or RUNTIME_ROOT).resolve()
+  source = (resume.simulation_root if resume is not None
+            else (SOURCE_ROOT / config.source_simulation).resolve())
+  if (not source.is_dir()
+      or (resume is None and source.parent != SOURCE_ROOT.resolve())):
     raise ModernRunConfigurationError(
       f"source simulation does not exist: {config.source_simulation}")
   source_meta = _read_json(source / "reverie" / "meta.json")
@@ -967,11 +1588,12 @@ def run_modern_smallville(
   isolated_source = storage_root / source_code
   shutil.copytree(source, isolated_source)
   fixture_seed = {}
-  if config.controlled_proximity:
-    fixture_seed = _bootstrap_controlled_proximity_source(isolated_source)
-  else:
-    _bootstrap_isolated_temporal_source(
-      isolated_source, config.cognitive_actors)
+  if resume is None:
+    if config.controlled_proximity:
+      fixture_seed = _bootstrap_controlled_proximity_source(isolated_source)
+    else:
+      _bootstrap_isolated_temporal_source(
+        isolated_source, config.cognitive_actors)
   meta = _read_json(isolated_source / "reverie" / "meta.json")
   source_step = meta.get("step")
   if type(source_step) is not int or source_step < 0:
@@ -982,8 +1604,19 @@ def run_modern_smallville(
     raise ModernRunConfigurationError("source actor registry is incompatible")
   fixture = controlled_replay.prepare_isolated_reverie_fixture(
     isolated_source, fixture_root, source, source_step)
-  embedding_preflight = controlled_replay.prepare_isolated_embedding_stores(
-    fixture)
+  if resume is None:
+    embedding_preflight = controlled_replay.prepare_isolated_embedding_stores(
+      fixture)
+  else:
+    copied_audits = tuple(_embedding_audits(
+      isolated_source, VISIBLE_ACTORS).values())
+    if any(audit.classification != controlled_replay.MODERN_COMPATIBLE
+           for audit in copied_audits):
+      raise ModernRunConfigurationError(
+        "resume copy embedding store is incompatible")
+    embedding_preflight = controlled_replay.IsolatedEmbeddingPreflightResult(
+      audits_before=copied_audits, audits_after=copied_audits,
+      bootstrapped_personas=())
 
   status_path, report_path = run_dir / "status.json", run_dir / "report.json"
   started_at = dt.datetime.now(dt.timezone.utc)
@@ -1030,6 +1663,13 @@ def run_modern_smallville(
   }
   movement_integrity = {}
   movement_integrity_valid = False
+  resume_hydration = {}
+  hydration_provider_calls = 0
+  causal_pre_resume = (
+    resume.causal_social_memory if resume is not None else {})
+  causal_hydrated = {}
+  causal_hydration = {}
+  causal_run_snapshot = {}
   controlled_fixture = {}
   interaction_observer = None
   execution_state = {"stage": "initialization", "actor": None,
@@ -1060,7 +1700,10 @@ def run_modern_smallville(
         stack.enter_context(use_llm_attempt_observer(observer))
         stack.enter_context(_use_event_poignancy_fail_safe())
 
+        calls_before_hydration = len(get_telemetry())
         server = reverie_module.ReverieServer(source_code, simulation_code)
+        hydration_provider_calls = (
+          len(get_telemetry()) - calls_before_hydration)
         if set(server.personas) != set(VISIBLE_ACTORS):
           raise ModernRuntimeInvariantError("visible actor registry changed")
         initial_step, initial_time = server.step, server.curr_time
@@ -1077,6 +1720,44 @@ def run_modern_smallville(
         actor_state_before = {
           name: _actor_state_metadata(server.personas[name])
           for name in config.cognitive_actors}
+        if resume is not None:
+          hydration_actors = {}
+          for name in config.cognitive_actors:
+            loaded = _loaded_actor_resume_metadata(server.personas[name])
+            copied_hash = _tree_sha256(
+              saved_root / "personas" / name / "bootstrap_memory")
+            hydration_actors[name] = _resume_actor_hydration_checks(
+              resume.actor_state[name], loaded, copied_hash)
+          source_time = dt.datetime.strptime(
+            resume.source_meta["curr_time"], DATE_FORMAT)
+          resume_hydration = {
+            "provider_calls": hydration_provider_calls,
+            "step_retained": server.step == resume.source_meta["step"],
+            "time_retained": server.curr_time == source_time,
+            "actors": hydration_actors,
+          }
+          resume_hydration["all_checks_passed"] = all((
+            hydration_provider_calls == 0,
+            resume_hydration["step_retained"],
+            resume_hydration["time_retained"],
+            all(checks["all_checks_passed"]
+                for checks in hydration_actors.values()),
+          ))
+          if not resume_hydration["all_checks_passed"]:
+            raise ModernRuntimeInvariantError(
+              "resume cognitive hydration validation failed")
+          if resume.request.observe_causal_social_memory:
+            causal_hydrated = _loaded_social_memory_snapshot(server.personas)
+            causal_hydration = _compare_social_memory_hydration(
+              causal_pre_resume, causal_hydrated)
+            causal_hydration["provider_calls"] = hydration_provider_calls
+            if not all((
+                causal_hydration["raw_social_memory_persisted"],
+                causal_hydration["derived_social_memory_persisted"],
+                causal_hydration["lineage_preserved"],
+                hydration_provider_calls == 0)):
+              raise ModernRuntimeInvariantError(
+                "causal social memory hydration validation failed")
         isolation_before = _actor_object_isolation(
           server.personas, config.cognitive_actors, saved_root)
         passive_before = {
@@ -1107,7 +1788,14 @@ def run_modern_smallville(
                 server, config.passive_actors) as passive_controller,
               _observe_conversations(
                 server, execution_state,
-                simulation_code) as interaction_observer):
+                simulation_code,
+                (causal_pre_resume.get("derived_node_refs", ())
+                 if resume is not None
+                 and resume.request.observe_causal_social_memory else ()),
+                (causal_pre_resume.get("chat_node_refs", ())
+                 if resume is not None
+                 and resume.request.observe_causal_social_memory else ()),
+              ) as interaction_observer):
           previous_tick_state = actor_state_before
           for tick in range(config.ticks):
             step_before, time_before = server.step, server.curr_time
@@ -1211,6 +1899,7 @@ def run_modern_smallville(
         actor_state_after = {
           name: _actor_state_metadata(server.personas[name])
           for name in config.cognitive_actors}
+        causal_run_snapshot = _loaded_social_memory_snapshot(server.personas)
         isolation_after = _actor_object_isolation(
           server.personas, config.cognitive_actors, saved_root)
         continuity.update({
@@ -1229,11 +1918,29 @@ def run_modern_smallville(
           for tick in range(config.ticks))
         frame_hashes_before_save = {
           path.name: _file_sha256(path) for path in expected_frames}
+        prior_frame_hashes_before_save = ({
+          name: _file_sha256(saved_root / "movement" / name)
+          for name in resume.movement_hashes
+        } if resume is not None else {})
+        prior_environment_hashes_before_save = ({
+          name: _file_sha256(saved_root / "environment" / name)
+          for name in resume.environment_hashes
+        } if resume is not None else {})
         execution_state.update(stage="save", actor=None, tick=server.step)
         server.save()
         save_passed = True
+        if resume is None:
+          causal_run_snapshot = _persisted_social_memory_snapshot(saved_root)
         frame_hashes_after_save = {
           path.name: _file_sha256(path) for path in expected_frames}
+        prior_frame_hashes_after_save = ({
+          name: _file_sha256(saved_root / "movement" / name)
+          for name in resume.movement_hashes
+        } if resume is not None else {})
+        prior_environment_hashes_after_save = ({
+          name: _file_sha256(saved_root / "environment" / name)
+          for name in resume.environment_hashes
+        } if resume is not None else {})
         saved_embedding_audits = _embedding_audits(
           saved_root, config.cognitive_actors)
         saved_embedding_metadata = {
@@ -1261,8 +1968,21 @@ def run_modern_smallville(
         reload_frame_hashes = {
           path.name: _file_sha256(reload_movement_root / path.name)
           for path in expected_frames}
+        reload_prior_frame_hashes = ({
+          name: _file_sha256(reload_movement_root / name)
+          for name in resume.movement_hashes
+        } if resume is not None else {})
+        reload_prior_environment_hashes = ({
+          name: _file_sha256(
+            storage_root / reload_code / "environment" / name)
+          for name in resume.environment_hashes
+        } if resume is not None else {})
+        prior_frame_count = (
+          len(resume.movement_hashes) if resume is not None else 0)
+        expected_total_frames = prior_frame_count + config.ticks
         movement_integrity = {
           "expected_frame_count": config.ticks,
+          "expected_total_frame_count": expected_total_frames,
           "saved_frame_count": len(list(
             (saved_root / "movement").glob("*.json"))),
           "reload_frame_count": len(list(reload_movement_root.glob("*.json"))),
@@ -1275,14 +1995,37 @@ def run_modern_smallville(
           "reload_copy_matches": (
             frame_hashes_before_save == reload_frame_hashes),
           "frame_hashes": frame_hashes_before_save,
+          "prior_frame_hashes": prior_frame_hashes_before_save,
+          "prior_frames_match_source": (
+            resume is None or prior_frame_hashes_before_save
+            == resume.movement_hashes),
+          "prior_frames_unchanged_by_save": (
+            prior_frame_hashes_before_save == prior_frame_hashes_after_save),
+          "prior_frames_preserved_on_reload": (
+            prior_frame_hashes_before_save == reload_prior_frame_hashes),
+          "prior_environment_matches_source": (
+            resume is None or prior_environment_hashes_before_save
+            == resume.environment_hashes),
+          "prior_environment_unchanged_by_save": (
+            prior_environment_hashes_before_save
+            == prior_environment_hashes_after_save),
+          "prior_environment_preserved_on_reload": (
+            prior_environment_hashes_before_save
+            == reload_prior_environment_hashes),
         }
         movement_integrity_valid = all((
-          movement_integrity["saved_frame_count"] == config.ticks,
-          movement_integrity["reload_frame_count"] == config.ticks,
+          movement_integrity["saved_frame_count"] == expected_total_frames,
+          movement_integrity["reload_frame_count"] == expected_total_frames,
           movement_integrity["all_frames_distinct"],
           movement_integrity["unchanged_by_save"],
           movement_integrity["unchanged_by_reload"],
           movement_integrity["reload_copy_matches"],
+          movement_integrity["prior_frames_match_source"],
+          movement_integrity["prior_frames_unchanged_by_save"],
+          movement_integrity["prior_frames_preserved_on_reload"],
+          movement_integrity["prior_environment_matches_source"],
+          movement_integrity["prior_environment_unchanged_by_save"],
+          movement_integrity["prior_environment_preserved_on_reload"],
         ))
         memory_preserved = all(
           _memory_counts(server.personas[name])
@@ -1318,7 +2061,8 @@ def run_modern_smallville(
           len(reloaded.personas) == len(VISIBLE_ACTORS),
           memory_preserved, state_preserved, embeddings_valid, isolation_valid,
           all(continuity.values()), movement_integrity_valid,
-          movement_count == len(list((saved_root / "movement").glob("*.json"))),
+          expected_total_frames
+          == len(list((saved_root / "movement").glob("*.json"))),
         ))
         reloaded_summary = {
           "step": reloaded.step, "curr_time": reloaded.curr_time,
@@ -1465,6 +2209,71 @@ def run_modern_smallville(
   reactions = interaction_observer.reactions if interaction_observer else []
   conversations = (
     interaction_observer.conversations if interaction_observer else [])
+  retrieval_events = (
+    interaction_observer.retrieval_events if interaction_observer else [])
+  relationship_events = (
+    interaction_observer.relationship_events if interaction_observer else [])
+  last_chat_events = (
+    interaction_observer.last_chat_events if interaction_observer else [])
+  causal_observation_enabled = bool(
+    resume is not None and resume.request.observe_causal_social_memory)
+  retrieved_derived_refs = {
+    node_ref for event in retrieval_events
+    for node_ref in event[
+      "retrieved_pre_resume_derived_social_node_refs"]}
+  consumed_derived_refs = {
+    node_ref for event in relationship_events
+    for node_ref in event[
+      "pre_resume_derived_social_node_refs_present"]}
+  causal_classification = _classify_causal_social_memory(
+    raw_social_memory_persisted=(
+      causal_hydration.get("raw_social_memory_persisted", False)),
+    derived_social_memory_persisted=(
+      causal_hydration.get("derived_social_memory_persisted", False)),
+    lineage_preserved_after_hydration=(
+      causal_hydration.get("lineage_preserved", False)),
+    pre_resume_derived_node_ids=(
+      causal_pre_resume.get("derived_node_refs", ())),
+    retrieved_node_ids=retrieved_derived_refs,
+    consumed_node_ids=consumed_derived_refs)
+  causal_report = {
+    "observation_enabled": causal_observation_enabled,
+    "pre_resume": (causal_pre_resume if resume is not None
+                   else causal_run_snapshot),
+    "hydration": ({
+      **causal_hydration,
+      "hydrated_snapshot": causal_hydrated,
+    } if causal_observation_enabled else None),
+    "retrieval": {
+      "events": retrieval_events,
+      "pre_resume_derived_nodes_retrieved":
+        causal_classification[
+          "retrieved_pre_resume_derived_social_node_ids"],
+    },
+    "relationship": {
+      "events": relationship_events,
+      "pre_resume_derived_nodes_consumed":
+        causal_classification[
+          "consumed_pre_resume_derived_social_node_ids"],
+    },
+    "last_chat": {
+      "events": last_chat_events,
+      "last_chat_social_context_observed": any(
+        event["pre_resume_chat_node_observed"]
+        for event in last_chat_events),
+    },
+    **causal_classification,
+    "last_accessed_persistence_gap_detected": (
+      causal_pre_resume.get(
+        "last_accessed_persistence_gap_detected", False)
+      if resume is not None else causal_run_snapshot.get(
+        "last_accessed_persistence_gap_detected", False)),
+    "candidate_material_preserved": (
+      causal_hydration.get("derived_social_memory_persisted", False)
+      if causal_observation_enabled else None),
+    "ranking_state_fidelity": (
+      "NOT_FULLY_GUARANTEED" if causal_observation_enabled else None),
+  }
   bilateral_encounter = all(any(
     row["observer"] == actor and row["target"] == target
     for row in encounters)
@@ -1505,14 +2314,29 @@ def run_modern_smallville(
                  cognitive_moves_valid, passive_moves_valid,
                  isolation_valid, actor_structures_valid,
                  continuity_valid, tick_progression_valid,
-                 movement_integrity_valid, telemetry_attribution_valid))
+                 movement_integrity_valid, telemetry_attribution_valid,
+                 resume is None or (
+                   resume_hydration.get("all_checks_passed", False)
+                   and source_hash_before == _tree_sha256(source))))
   r1m3b_policy = (
     config.ticks == 5 and config.cognitive_actors == VISIBLE_ACTORS
     and not config.passive_actors)
   r1m3a_policy = (
     config.ticks == 1 and config.cognitive_actors == VISIBLE_ACTORS
     and not config.passive_actors)
-  if success and r1m3b_policy:
+  if causal_observation_enabled:
+    if not success:
+      verdict = R1CLI_A2_B_BLOCKED_VERDICT
+    elif not relationship_events:
+      verdict = R1CLI_A2_B_PATH_NOT_REACHED_VERDICT
+    elif causal_classification["causal_link_verified"]:
+      verdict = R1CLI_A2_B_READY_VERDICT
+    else:
+      verdict = R1CLI_A2_B_BLOCKED_VERDICT
+  elif resume is not None:
+    verdict = (R1CLI_A2_A_READY_VERDICT if success
+               else R1CLI_A2_A_BLOCKED_VERDICT)
+  elif success and r1m3b_policy:
     verdict = "R1M3_B_THREE_COGNITIVE_ACTORS_FIVE_TICKS_PASSED"
   elif success and r1m3a_policy:
     verdict = "R1M3_A_THREE_COGNITIVE_ACTORS_ONE_TICK_PASSED"
@@ -1524,7 +2348,7 @@ def run_modern_smallville(
     verdict = "R1M3_A_BLOCKED"
   else:
     verdict = "MODERN_SMALLVILLE_HEADLESS_RUN_FAILED"
-  if config.controlled_proximity:
+  if resume is None and config.controlled_proximity:
     conversation_callers = {
       "agent_chat_summarize_relationship", "iterative_chat_utterance",
       "summarize_conversation", "chat_poignancy"}
@@ -1571,6 +2395,22 @@ def run_modern_smallville(
   report = {
     "result": asdict(result),
     "config": asdict(config),
+    "resume": (None if resume is None else {
+      "source_run": resume.source_run,
+      "source_simulation": resume.simulation_root,
+      "persisted_initial_step": resume.source_meta["step"],
+      "persisted_initial_time": resume.source_meta["curr_time"],
+      "continuation_strategy": "STANFORD_FORK_COPY",
+      "hydration": resume_hydration,
+      "hydration_provider_calls": hydration_provider_calls,
+      "history_preserved": movement_integrity_valid,
+      "cognitive_state_preserved": resume_hydration.get(
+        "all_checks_passed", False),
+      "old_frame_hashes": resume.movement_hashes,
+      "new_frame_hashes": movement_integrity.get("frame_hashes", {}),
+      "old_environment_hashes": resume.environment_hashes,
+    }),
+    "causal_resume": causal_report,
     "actor_policy": {"cognitive": config.cognitive_actors,
                      "passive": config.passive_actors,
                      "visible": config.visible_actors},
@@ -1732,6 +2572,16 @@ def build_parser() -> argparse.ArgumentParser:
   run.add_argument(
     "--controlled-proximity", action="store_true",
     help="use the isolated daytime R1M3-C encounter fixture")
+  resume = commands.add_parser(
+    "resume", help="continue a validated persisted modern run")
+  resume.add_argument("--from", dest="source_run", type=Path, required=True)
+  resume.add_argument("--ticks", type=_positive_int, default=5)
+  resume.add_argument("--name")
+  resume.add_argument("--cost-ceiling", type=_decimal_argument,
+                      default=DEFAULT_COST_CEILING)
+  resume.add_argument(
+    "--observe-causal-social-memory", action="store_true",
+    help="observe persisted Chat-derived Event/Thought social cognition")
   return parser
 
 
@@ -1774,20 +2624,28 @@ def main(argv: Optional[list[str]] = None) -> int:
   parser = build_parser()
   try:
     args = parser.parse_args(argv)
-    cognitive_actors = (
-      VISIBLE_ACTORS if args.cognitive == "all" else (COGNITIVE_ACTOR,))
-    passive_actors = tuple(
-      name for name in VISIBLE_ACTORS if name not in cognitive_actors)
-    config = ModernRunConfig(
-      source_simulation=args.source,
-      run_name=args.name or generate_run_name(),
-      ticks=args.ticks,
-      cost_ceiling_usd=args.cost_ceiling,
-      cognitive_actors=cognitive_actors,
-      passive_actors=passive_actors,
-      controlled_proximity=args.controlled_proximity,
-    )
-    result = run_modern_smallville(config)
+    if args.command == "resume":
+      config = ModernResumeConfig(
+        source_run=args.source_run,
+        run_name=args.name or generate_run_name(), ticks=args.ticks,
+        cost_ceiling_usd=args.cost_ceiling,
+        observe_causal_social_memory=args.observe_causal_social_memory)
+      result = run_modern_smallville_resume(config)
+    else:
+      cognitive_actors = (
+        VISIBLE_ACTORS if args.cognitive == "all" else (COGNITIVE_ACTOR,))
+      passive_actors = tuple(
+        name for name in VISIBLE_ACTORS if name not in cognitive_actors)
+      config = ModernRunConfig(
+        source_simulation=args.source,
+        run_name=args.name or generate_run_name(),
+        ticks=args.ticks,
+        cost_ceiling_usd=args.cost_ceiling,
+        cognitive_actors=cognitive_actors,
+        passive_actors=passive_actors,
+        controlled_proximity=args.controlled_proximity,
+      )
+      result = run_modern_smallville(config)
   except ModernRunConfigurationError as error:
     print(f"configuration error: {error}", file=sys.stderr)
     return EXIT_CONFIGURATION
@@ -1803,7 +2661,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"runtime failure: {type(error).__name__}: {error}", file=sys.stderr)
     return EXIT_RUNTIME_FAILURE
   print(_render(result))
-  if result.verdict.endswith("PASSED"):
+  if (result.verdict.endswith("PASSED")
+      or result.verdict in (
+        R1CLI_A2_A_READY_VERDICT, R1CLI_A2_B_READY_VERDICT)):
     return EXIT_SUCCESS
   if result.exception_type in (
       "ReplayCostCeilingExceededError", "ReplayCostGuardAlreadyTrippedError"):

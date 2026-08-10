@@ -223,7 +223,8 @@ def reflect(persona):
       s, p, o = generate_action_event_triple(planning_thought, persona)
       keywords = set([s, p, o])
       thought_poignancy = generate_poig_score(persona, "thought", planning_thought)
-      thought_embedding_pair = (planning_thought, get_embedding(planning_thought))
+      thought_embedding_pair = (planning_thought, get_embedding(
+        planning_thought, caller_id="planning_thought_on_convo"))
 
       persona.a_mem.add_thought(created, expiration, s, p, o, 
                                 planning_thought, keywords, thought_poignancy, 
@@ -239,7 +240,8 @@ def reflect(persona):
       s, p, o = generate_action_event_triple(memo_thought, persona)
       keywords = set([s, p, o])
       thought_poignancy = generate_poig_score(persona, "thought", memo_thought)
-      thought_embedding_pair = (memo_thought, get_embedding(memo_thought))
+      thought_embedding_pair = (memo_thought, get_embedding(
+        memo_thought, caller_id="memo_on_convo"))
 
       persona.a_mem.add_thought(created, expiration, s, p, o, 
                                 memo_thought, keywords, thought_poignancy, 

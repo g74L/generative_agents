@@ -19,12 +19,34 @@ from persona.memory_structures.embedding_space import (
   read_embedding_manifest,
   use_runtime_embedding_manifest,
 )
+from persona.prompt_template.chat_runtime import ModernChatCallerNotAllowedError
 from persona.prompt_template.llm_provider_config import (
   LEGACY_OPENAI,
   MODERN_OPENAI,
   LLMProviderConfig,
   modern_openai_config,
 )
+
+
+# Embedding calls that have been migrated to explicit caller attribution.
+# Each entry is the caller_id already used by the completion/chat request that
+# produced the exact text being embedded -- the semantic owner of that text,
+# not merely "the most recent caller seen" before the embedding call.
+M2_EMBEDDING_CALLER_ALLOWLIST = (
+  "planning_thought_on_convo",
+  "memo_on_convo",
+)
+
+
+def validate_modern_embedding_caller(caller_id):
+  """Fail-closed Embedding caller gate; mirrors the Chat/CompletionCompat
+  guards in chat_runtime.py / completion_runtime.py.  Anonymous or unknown
+  callers are rejected -- there is no wildcard or implicit fallback."""
+  if (not isinstance(caller_id, str) or not caller_id.strip()
+      or caller_id not in M2_EMBEDDING_CALLER_ALLOWLIST):
+    raise ModernChatCallerNotAllowedError(
+      "Modern Embedding caller is missing or not authorized")
+  return caller_id
 
 
 TEXT_EMBEDDING_3_SMALL_MODEL = "text-embedding-3-small"

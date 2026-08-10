@@ -17,10 +17,12 @@ BACKEND_SERVER = Path(__file__).resolve().parents[1]
 if str(BACKEND_SERVER) not in sys.path:
   sys.path.insert(0, str(BACKEND_SERVER))
 
+from persona.cognitive_modules import reflect as reflect_module
 from persona.prompt_template import gpt_structure
 from persona.prompt_template import run_gpt_prompt
 from persona.prompt_template.chat_runtime import (
   M5_CHAT_MODEL,
+  ModernChatCallerNotAllowedError,
   build_modern_chat_runtime_config,
   use_modern_chat_runtime,
 )
@@ -52,9 +54,11 @@ from persona.prompt_template.cost_ledger import (
   use_cost_ledger_context,
 )
 from persona.prompt_template.embedding_runtime import (
+  M2_EMBEDDING_CALLER_ALLOWLIST,
   TEXT_EMBEDDING_3_SMALL_MODEL,
   build_modern_embedding_runtime_config,
   use_embedding_runtime,
+  validate_modern_embedding_caller,
 )
 from persona.prompt_template.llm_provider import (
   CHAT,
@@ -62,6 +66,7 @@ from persona.prompt_template.llm_provider import (
   COMPLETION_COMPAT,
   EMBEDDING,
   ERROR,
+  MEMORY_WRITE,
   SUCCESS,
   FakeProvider,
   LLMReplayContext,
@@ -87,9 +92,13 @@ from persona.prompt_template.llm_provider_config import (
   reset_llm_provider_config,
 )
 from persona.prompt_template.modern_openai_provider import (
+  LLMAuthenticationError,
+  LLMIncompleteResponseError,
   LLMInvalidRequestError,
+  LLMRefusalError,
   LLMTimeoutError,
   ModernChatResponseValidationError,
+  ModernOpenAIClientAdapter,
   ModernOpenAIProvider,
   NormalizedEmbeddingResponse,
   NormalizedTextResponse,
@@ -118,6 +127,49 @@ class FakeCompletionCompatAdapter:
     if isinstance(response, Exception):
       raise response
     return response
+
+
+class FakeModernChatEndpoint:
+  def __init__(self, *responses):
+    self.responses = list(responses)
+    self.calls = []
+
+  def create(self, **kwargs):
+    self.calls.append(kwargs)
+    if not self.responses:
+      raise AssertionError("No modern Chat response configured")
+    response = self.responses.pop(0)
+    if isinstance(response, Exception):
+      raise response
+    return response
+
+
+def sdk_chat_response(content="answer", finish_reason="stop", status=None,
+                      input_tokens=20, output_tokens=8):
+  response = {
+    "choices": [{
+      "message": {"content": content, "refusal": None},
+      "finish_reason": finish_reason,
+    }],
+    "model": COMPLETION_COMPAT_MODEL,
+    "_request_id": "req-planning-compat",
+    "usage": {
+      "prompt_tokens": input_tokens,
+      "completion_tokens": output_tokens,
+      "total_tokens": input_tokens + output_tokens,
+    },
+  }
+  if status is not None:
+    response["status"] = status
+  return response
+
+
+def modern_sdk_adapter(*responses):
+  endpoint = FakeModernChatEndpoint(*responses)
+  client = SimpleNamespace(
+    chat=SimpleNamespace(completions=endpoint),
+    embeddings=SimpleNamespace(create=lambda **unused: None))
+  return ModernOpenAIClientAdapter(client=client), endpoint
 
 
 class FakeEmbeddingAdapter:
@@ -1028,6 +1080,272 @@ class ModernCompletionMigrationTests(unittest.TestCase):
       with self.subTest(changes=changes):
         with self.assertRaises((TypeError, ValueError)):
           LLMReplayContext(**changes)
+
+  def test_67_planning_thought_valid_output_matches_legacy_contract(self):
+    persona = SimpleNamespace(scratch=SimpleNamespace(name="Maria Lopez"))
+    legacy = FakeProvider()
+    legacy.queue_completion_response("Remember the appointment")
+    with patch.object(run_gpt_prompt, "debug", False), patch.object(
+        run_gpt_prompt, "generate_prompt", return_value="exact prompt"), (
+        use_provider(legacy)):
+      historical = run_gpt_prompt.run_gpt_prompt_planning_thought_on_convo(
+        persona, "conversation")
+
+    adapter, unused_endpoint = modern_sdk_adapter(
+      sdk_chat_response("Remember the appointment"))
+    with patch.object(run_gpt_prompt, "debug", False), patch.object(
+        run_gpt_prompt, "generate_prompt", return_value="exact prompt"), (
+        use_modern_completion_runtime(
+          build_modern_completion_runtime_config(), adapter)):
+      modern = run_gpt_prompt.run_gpt_prompt_planning_thought_on_convo(
+        persona, "conversation")
+
+    self.assertEqual("Remember the appointment", historical[0])
+    self.assertEqual(historical[0], modern[0])
+    self.assertIsInstance(modern[0], str)
+    self.assertEqual("...", modern[1][-1])
+
+  def test_68_planning_length_output_is_accepted_only_in_completion_compat(self):
+    partial = "Remember the appointment because it affects tomorrow"
+    adapter, endpoint = modern_sdk_adapter(sdk_chat_response(
+      partial, finish_reason="length", input_tokens=857, output_tokens=50))
+    persona = SimpleNamespace(scratch=SimpleNamespace(name="Maria Lopez"))
+    context = LLMReplayContext(
+      actor_id="Maria Lopez", simulation_id="fixture", simulation_step=107)
+    with patch.object(run_gpt_prompt, "debug", False), patch.object(
+        run_gpt_prompt, "generate_prompt", return_value="exact prompt"), (
+        use_llm_replay_context(context)), use_modern_completion_runtime(
+          build_modern_completion_runtime_config(), adapter):
+      output = run_gpt_prompt.run_gpt_prompt_planning_thought_on_convo(
+        persona, "conversation")[0]
+
+    self.assertEqual(partial, output)
+    self.assertEqual({
+      "model": COMPLETION_COMPAT_MODEL,
+      "messages": [{"role": "user", "content": "exact prompt"}],
+      "store": False,
+      "temperature": 0,
+      "max_tokens": 50,
+      "top_p": 1,
+      "frequency_penalty": 0,
+      "presence_penalty": 0,
+    }, endpoint.calls[0])
+    event = get_telemetry()[0]
+    self.assertEqual((
+      COMPLETION_COMPAT, SUCCESS, "planning_thought_on_convo",
+      "Maria Lopez", 107, "length", 857, 50), (
+        event.operation, event.outcome, event.caller_id, event.actor_id,
+        event.simulation_step, event.finish_reason,
+        event.input_tokens, event.output_tokens))
+
+  def test_69_native_chat_length_policy_remains_fail_closed(self):
+    adapter, unused_endpoint = modern_sdk_adapter(
+      sdk_chat_response("partial", finish_reason="length"))
+    with self.assertRaises(LLMIncompleteResponseError):
+      adapter.create_chat(model=COMPLETION_COMPAT_MODEL, messages=[])
+
+  def test_70_completion_compat_does_not_accept_other_incomplete_states(self):
+    fixtures = (
+      sdk_chat_response("filtered", finish_reason="content_filter"),
+      sdk_chat_response("partial", finish_reason="length",
+                        status="incomplete"),
+    )
+    for response in fixtures:
+      with self.subTest(response=response):
+        clear_telemetry()
+        adapter, unused_endpoint = modern_sdk_adapter(response)
+        with self.assertRaises(LLMIncompleteResponseError):
+          self.execute(adapter)
+
+  def test_71_completion_compat_hard_errors_do_not_become_fail_safe(self):
+    for error in (
+        LLMAuthenticationError("auth"), LLMRefusalError("policy")):
+      with self.subTest(error=type(error).__name__):
+        clear_telemetry()
+        with self.assertRaises(type(error)):
+          self.execute(FakeCompletionCompatAdapter(error))
+
+  def test_72_planning_stop_and_budget_match_historical_transport(self):
+    adapter, endpoint = modern_sdk_adapter(sdk_chat_response())
+    persona = SimpleNamespace(scratch=SimpleNamespace(name="Maria Lopez"))
+    with patch.object(run_gpt_prompt, "debug", False), patch.object(
+        run_gpt_prompt, "generate_prompt", return_value="prompt"), (
+        use_modern_completion_runtime(
+          build_modern_completion_runtime_config(), adapter)):
+      run_gpt_prompt.run_gpt_prompt_planning_thought_on_convo(
+        persona, "conversation")
+    self.assertEqual(50, endpoint.calls[0]["max_tokens"])
+    self.assertNotIn("stop", endpoint.calls[0])
+    self.assertNotIn("stream", endpoint.calls[0])
+
+
+class PostConversationEmbeddingAttributionTests(unittest.TestCase):
+  """R1EMB-P1: the post-conversation embedding call reflect.py issues right
+  after planning_thought_on_convo -> event_triple -> event_poignancy must
+  reach the modern runtime with explicit, policy-authorized attribution
+  instead of caller=None (live evidence: r1cli-a2-b-process-b3, tick 107)."""
+
+  def setUp(self):
+    reset_provider()
+    reset_llm_provider_config()
+    reset_embedding_cache()
+    clear_telemetry()
+    self.sleep_patch = patch.object(gpt_structure, "temp_sleep")
+    self.sleep_patch.start()
+
+  def tearDown(self):
+    self.sleep_patch.stop()
+    reset_provider()
+    reset_llm_provider_config()
+    reset_embedding_cache()
+    clear_telemetry()
+
+  def _persona(self, name="Maria Lopez"):
+    return SimpleNamespace(
+      name=name,
+      scratch=SimpleNamespace(
+        name=name,
+        get_str_iss=lambda: f"{name} is a resident of Smallville."))
+
+  def _run_post_conversation_chain(self, persona, context=None,
+                                   embedding_adapter=None):
+    """Exercise the exact chain from the audit: generate_planning_thought_on_convo
+    -> post-conversation memory construction -> event_triple -> event_poignancy
+    -> embedding, using the real reflect.py/gpt_structure.py functions against
+    fake transports.  Stops where reflect.py's post-conversation block does
+    its first embedding write, matching the scope of the audited defect."""
+    compat_adapter = FakeCompletionCompatAdapter(
+      normalized_response("Remember the appointment"),
+      normalized_response("planning, thinking)"))
+    chat_adapter = FakeCompletionCompatAdapter(
+      normalized_response('{"output": "7"}'))
+    embedding_adapter = embedding_adapter or FakeEmbeddingAdapter()
+    context = context or LLMReplayContext(
+      cognitive_category="WORLD_TICK", actor_id=persona.name,
+      simulation_id="r1emb-p1-offline", simulation_step=107)
+    all_utt = f"{persona.name}: Hi\nKlaus Mueller: Hi\n"
+    with patch.object(run_gpt_prompt, "debug", False), patch.object(
+        run_gpt_prompt, "generate_prompt", return_value="exact prompt"), (
+        use_llm_replay_context(context)), use_modern_completion_runtime(
+        build_modern_completion_runtime_config(), compat_adapter), (
+        use_modern_chat_runtime(
+          build_modern_chat_runtime_config(), chat_adapter)), (
+        use_embedding_runtime(
+          build_modern_embedding_runtime_config(), embedding_adapter)):
+      planning_thought = reflect_module.generate_planning_thought_on_convo(
+        persona, all_utt)
+      planning_thought = f"For {persona.scratch.name}'s planning: {planning_thought}"
+      triple = reflect_module.generate_action_event_triple(
+        planning_thought, persona)
+      thought_poignancy = reflect_module.generate_poig_score(
+        persona, "thought", planning_thought)
+      vector = gpt_structure.get_embedding(
+        planning_thought, caller_id="planning_thought_on_convo")
+    return planning_thought, triple, thought_poignancy, vector
+
+  def _embedding_event(self):
+    matches = [event for event in get_telemetry()
+              if event.operation == EMBEDDING]
+    self.assertEqual(1, len(matches))
+    return matches[0]
+
+  def test_r1emb_p1_a_post_conversation_embedding_is_attributed(self):
+    persona = self._persona()
+    _, _, _, vector = self._run_post_conversation_chain(persona)
+
+    self.assertEqual(1536, len(vector))
+    event = self._embedding_event()
+    self.assertIsNotNone(event.caller_id)
+    self.assertEqual("Maria Lopez", event.actor_id)
+    self.assertEqual(EMBEDDING, event.operation)
+    self.assertEqual(SUCCESS, event.outcome)
+
+  def test_r1emb_p1_b_semantic_owner_is_the_exact_caller(self):
+    """The embedded text is planning_thought_on_convo's own output, so that
+    is the correct semantic owner -- not the intervening event_triple or
+    event_poignancy callers that merely ran afterward."""
+    persona = self._persona()
+    self._run_post_conversation_chain(persona)
+
+    event = self._embedding_event()
+    self.assertEqual("planning_thought_on_convo", event.caller_id)
+    self.assertEqual(MEMORY_WRITE, event.cognitive_category)
+    caller_sequence = [event.caller_id for event in get_telemetry()]
+    self.assertEqual(
+      ["planning_thought_on_convo", "event_triple", "event_poignancy",
+       "planning_thought_on_convo"],
+      caller_sequence)
+
+  def test_r1emb_p1_c_anonymous_embedding_caller_is_rejected(self):
+    with self.assertRaises(ModernChatCallerNotAllowedError):
+      validate_modern_embedding_caller(None)
+
+  def test_r1emb_p1_c2_anonymous_caller_fails_closed_through_the_real_seam(self):
+    """caller=None must still fail once inside an active modern runtime --
+    the guard being added here must not be bypassable at the call site."""
+    with use_modern_chat_runtime(
+        build_modern_chat_runtime_config(), FakeCompletionCompatAdapter()):
+      with self.assertRaises(ModernChatCallerNotAllowedError):
+        with gpt_structure.use_modern_embedding_caller_if_active(None):
+          pass
+
+  def test_r1emb_p1_d_unknown_embedding_caller_is_rejected(self):
+    self.assertNotIn("unknown", M2_EMBEDDING_CALLER_ALLOWLIST)
+    with self.assertRaises(ModernChatCallerNotAllowedError):
+      validate_modern_embedding_caller("unknown")
+    with use_modern_chat_runtime(
+        build_modern_chat_runtime_config(), FakeCompletionCompatAdapter()):
+      with self.assertRaises(ModernChatCallerNotAllowedError):
+        with gpt_structure.use_modern_embedding_caller_if_active("unknown"):
+          pass
+
+  def test_r1emb_p1_e_unmigrated_embedding_call_sites_are_unaffected(self):
+    """perceive.py/retrieve.py/plan.py/converse.py all call get_embedding
+    without a caller_id; that is out of this wave's scope and must keep
+    working exactly as before, even while the modern runtimes are active."""
+    embedding_adapter = FakeEmbeddingAdapter()
+    with use_modern_chat_runtime(
+        build_modern_chat_runtime_config(), FakeCompletionCompatAdapter()):
+      with use_embedding_runtime(
+          build_modern_embedding_runtime_config(), embedding_adapter):
+        vector = gpt_structure.get_embedding("unattributed perception text")
+    self.assertEqual(1536, len(vector))
+    event = self._embedding_event()
+    self.assertIsNone(event.caller_id)
+    self.assertEqual(SUCCESS, event.outcome)
+
+  def test_r1emb_p1_f_actor_attribution_follows_the_ambient_replay_context(self):
+    persona = self._persona("Klaus Mueller")
+    context = LLMReplayContext(
+      cognitive_category="WORLD_TICK", actor_id="Klaus Mueller",
+      simulation_id="r1emb-p1-offline", simulation_step=42)
+    self._run_post_conversation_chain(persona, context=context)
+
+    event = self._embedding_event()
+    self.assertEqual("Klaus Mueller", event.actor_id)
+    self.assertEqual(42, event.simulation_step)
+    self.assertEqual("r1emb-p1-offline", event.simulation_id)
+
+  def test_r1emb_p1_g_cost_ledger_records_full_attribution(self):
+    persona = self._persona()
+    self._run_post_conversation_chain(persona)
+
+    event = self._embedding_event()
+    record = build_cost_ledger_records((event,))[0]
+    self.assertEqual("planning_thought_on_convo", record.caller_id)
+    self.assertEqual("Maria Lopez", record.actor_id)
+    self.assertEqual(EMBEDDING, record.operation)
+    self.assertEqual(MEMORY_WRITE, record.cognitive_category)
+
+  def test_r1emb_p1_h_get_embedding_signature_stays_backward_compatible(self):
+    """caller_id is additive and keyword-only; every existing positional
+    call to get_embedding(text) or get_embedding(text, model) is unaffected."""
+    import inspect
+    parameters = inspect.signature(gpt_structure.get_embedding).parameters
+    self.assertEqual(["text", "model", "caller_id"], list(parameters))
+    self.assertIsNone(parameters["caller_id"].default)
+    self.assertEqual(
+      inspect.Parameter.KEYWORD_ONLY, parameters["caller_id"].kind)
 
 
 if __name__ == "__main__":

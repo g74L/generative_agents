@@ -29,7 +29,11 @@ from persona.prompt_template.chat_runtime import (
   run_modern_chat,
   validate_modern_chat_caller,
 )
+from persona.prompt_template.embedding_runtime import (
+  validate_modern_embedding_caller,
+)
 from persona.prompt_template.llm_provider import (
+  MEMORY_WRITE,
   PLANNING,
   chat_completion,
   embedding,
@@ -94,6 +98,27 @@ def use_modern_chat_caller_if_active(
     with use_modern_chat_caller(
         caller_id, model, temperature, max_tokens, stop):
       yield
+
+
+@contextmanager
+def use_modern_embedding_caller_if_active(caller_id):
+  """Attribute a migrated post-conversation embedding caller without
+  changing the unattributed legacy direct-call mode still used by every
+  other ``get_embedding`` call site (perception, retrieval, planning,
+  conversation).  Mirrors ``use_modern_chat_caller_if_active``: outside an
+  active modern runtime this is a no-op; inside one, the caller is
+  validated and attributed to the replay context before the physical
+  embedding attempt, and rejected (fail-closed) if missing or unknown."""
+  if get_modern_chat_runtime_config() is None:
+    yield
+  else:
+    validate_modern_embedding_caller(caller_id)
+    effective_context = replace(
+      get_llm_replay_context(), caller_id=caller_id,
+      cognitive_category=MEMORY_WRITE)
+    with use_llm_replay_context(effective_context):
+      yield
+
 
 def temp_sleep(seconds=0.1):
   time.sleep(seconds)
@@ -407,13 +432,17 @@ def safe_generate_response(prompt,
   return fail_safe_response
 
 
-def get_embedding(text, model=None):
+def get_embedding(text, model=None, *, caller_id=None):
   model = model or get_runtime_embedding_manifest().model
   text = text.replace("\n", " ")
-  if not text: 
+  if not text:
     text = "this is blank"
-  return embedding(
-          input=[text], model=model)['data'][0]['embedding']
+  if caller_id is None:
+    return embedding(
+            input=[text], model=model)['data'][0]['embedding']
+  with use_modern_embedding_caller_if_active(caller_id):
+    return embedding(
+            input=[text], model=model)['data'][0]['embedding']
 
 
 if __name__ == '__main__':

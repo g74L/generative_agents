@@ -3,6 +3,7 @@ from decimal import Decimal
 from pathlib import Path
 import socket
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -132,6 +133,226 @@ class ModernRunConfigTests(unittest.TestCase):
           run_name="bad-controlled", controlled_proximity=True, **values)
 
 
+class ModernResumeConfigTests(unittest.TestCase):
+  def test_resume_config_is_explicit_and_valid(self):
+    config = subject.ModernResumeConfig(
+      source_run=Path("persisted-run"), run_name="continued-run", ticks=5,
+      cost_ceiling_usd=Decimal("0.05"))
+    self.assertEqual(Path("persisted-run"), config.source_run)
+    self.assertEqual(5, config.ticks)
+
+  def test_causal_social_observation_is_explicit(self):
+    config = subject.ModernResumeConfig(
+      source_run=Path("persisted-run"), run_name="continued-run",
+      observe_causal_social_memory=True)
+    self.assertTrue(config.observe_causal_social_memory)
+
+  def test_resume_config_rejects_invalid_ticks(self):
+    for value in (0, -1):
+      with self.subTest(value=value), self.assertRaises(
+          subject.ModernRunConfigurationError):
+        subject.ModernResumeConfig(
+          source_run=Path("persisted-run"), run_name="continued-run",
+          ticks=value)
+
+  def test_resume_config_rejects_non_path_source(self):
+    with self.assertRaises(subject.ModernRunConfigurationError):
+      subject.ModernResumeConfig(
+        source_run="persisted-run", run_name="continued-run")
+
+
+class CausalSocialMemoryTests(unittest.TestCase):
+  @staticmethod
+  def _nodes():
+    created = datetime.datetime(2023, 2, 13, 10, 0, 10)
+    return {
+      "node_1": SimpleNamespace(
+        node_id="node_1", type="chat", created=created,
+        embedding_key="conversation summary", object="Klaus Mueller",
+        filling=[["Maria Lopez", "content omitted"]],
+        last_accessed=created),
+      "node_2": SimpleNamespace(
+        node_id="node_2", type="event", created=created,
+        embedding_key="Maria chatted with Klaus", filling=["node_1"],
+        last_accessed=created),
+      "node_3": SimpleNamespace(
+        node_id="node_3", type="thought", created=created,
+        embedding_key="planning memory", filling=["node_1"],
+        last_accessed=created),
+    }
+
+  @classmethod
+  def _bilateral_nodes(cls):
+    maria = cls._nodes()
+    klaus = cls._nodes()
+    klaus["node_1"].object = "Maria Lopez"
+    return {"Maria Lopez": maria, "Klaus Mueller": klaus}
+
+  def test_chat_to_event_lineage_is_content_free(self):
+    snapshot = subject._social_memory_actor_snapshot(
+      "Maria Lopez", self._nodes())
+    event = snapshot["derived_event_nodes"][0]
+    self.assertEqual("node_2", event["node_id"])
+    self.assertEqual(["node_1"], event["source_chat_node_ids"])
+    self.assertEqual("filling", event["lineage_field"])
+    self.assertNotIn("embedding_key", event)
+
+  def test_chat_to_thought_evidence_lineage_is_recognized(self):
+    snapshot = subject._social_memory_actor_snapshot(
+      "Maria Lopez", self._nodes())
+    thought = snapshot["derived_thought_nodes"][0]
+    self.assertEqual("node_3", thought["node_id"])
+    self.assertEqual(["node_1"], thought["source_chat_node_ids"])
+    self.assertEqual("evidence", thought["lineage_field"])
+
+  def test_hydration_identity_and_lineage_are_compared(self):
+    before = subject._social_memory_snapshot({
+      "Maria Lopez": self._nodes(), "Klaus Mueller": self._nodes()})
+    hydrated = subject._social_memory_snapshot({
+      "Maria Lopez": self._nodes(), "Klaus Mueller": self._nodes()})
+    checks = subject._compare_social_memory_hydration(before, hydrated)
+    self.assertTrue(checks["raw_social_memory_persisted"])
+    self.assertTrue(checks["derived_social_memory_persisted"])
+    self.assertTrue(checks["lineage_preserved"])
+
+    broken_nodes = self._nodes()
+    broken_nodes["node_2"].filling = ["node_999"]
+    broken = subject._social_memory_snapshot({
+      "Maria Lopez": broken_nodes, "Klaus Mueller": self._nodes()})
+    self.assertFalse(subject._compare_social_memory_hydration(
+      before, broken)["lineage_preserved"])
+
+  def test_retrieval_observer_records_without_changing_return(self):
+    import persona.cognitive_modules.converse as converse_module
+    returned = {"Klaus Mueller": [self._nodes()["node_2"]]}
+    persona = SimpleNamespace(
+      name="Maria Lopez", perceive=lambda maze: [],
+      a_mem=SimpleNamespace(get_last_chat=lambda target: False))
+    server = SimpleNamespace(personas={"Maria Lopez": persona})
+    state = {"tick": 5}
+
+    def original_retrieve(unused_persona, unused_focal, unused_count=30):
+      return returned
+
+    with patch.object(converse_module, "new_retrieve", original_retrieve):
+      observer = subject._ConversationObserver(
+        server, state, "simulation",
+        pre_resume_derived_node_refs=("Maria Lopez::node_2",)).install()
+      try:
+        actual = converse_module.new_retrieve(
+          persona, ["Klaus Mueller"], 50)
+      finally:
+        observer.restore()
+    self.assertIs(returned, actual)
+    self.assertEqual(["node_2"], observer.retrieval_events[0][
+      "retrieved_node_ids"])
+    self.assertEqual(["Maria Lopez::node_2"], observer.retrieval_events[0][
+      "retrieved_pre_resume_derived_social_node_refs"])
+
+  def test_relationship_observer_preserves_arguments_and_output(self):
+    import persona.cognitive_modules.converse as converse_module
+    returned = {"Klaus Mueller": [self._nodes()["node_2"]]}
+    maria = SimpleNamespace(
+      name="Maria Lopez", perceive=lambda maze: [],
+      a_mem=SimpleNamespace(get_last_chat=lambda target: False))
+    klaus = SimpleNamespace(
+      name="Klaus Mueller", perceive=lambda maze: [],
+      a_mem=SimpleNamespace(get_last_chat=lambda target: False))
+    server = SimpleNamespace(personas={
+      "Maria Lopez": maria, "Klaus Mueller": klaus})
+    calls = []
+    sentinel = object()
+
+    def original_relationship(actor, target, retrieved):
+      calls.append((actor, target, retrieved))
+      return sentinel
+
+    with patch.object(
+        converse_module, "generate_summarize_agent_relationship",
+        original_relationship):
+      observer = subject._ConversationObserver(
+        server, {"tick": 5}, "simulation",
+        pre_resume_derived_node_refs=("Maria Lopez::node_2",)).install()
+      try:
+        actual = converse_module.generate_summarize_agent_relationship(
+          maria, klaus, returned)
+      finally:
+        observer.restore()
+    self.assertIs(sentinel, actual)
+    self.assertEqual((maria, klaus, returned), calls[0])
+    event = observer.relationship_events[0]
+    self.assertEqual(["node_2"], event["input_node_ids"])
+    self.assertEqual(
+      ["Maria Lopez::node_2"],
+      event["pre_resume_derived_social_node_refs_present"])
+
+  def test_positive_causal_classifier_requires_same_derived_node(self):
+    result = subject._classify_causal_social_memory(
+      raw_social_memory_persisted=True,
+      derived_social_memory_persisted=True,
+      lineage_preserved_after_hydration=True,
+      pre_resume_derived_node_ids=("Maria Lopez::node_2",),
+      retrieved_node_ids=("Maria Lopez::node_2",),
+      consumed_node_ids=("Maria Lopez::node_2",))
+    self.assertTrue(result["social_memory_causally_reused"])
+    self.assertTrue(result["causal_link_verified"])
+
+  def test_negative_causal_classifier_cases_fail_closed(self):
+    valid = {
+      "raw_social_memory_persisted": True,
+      "derived_social_memory_persisted": True,
+      "lineage_preserved_after_hydration": True,
+      "pre_resume_derived_node_ids": ("Maria Lopez::node_2",),
+      "retrieved_node_ids": ("Maria Lopez::node_2",),
+      "consumed_node_ids": ("Maria Lopez::node_2",),
+    }
+    cases = {
+      "derived missing": {"derived_social_memory_persisted": False},
+      "not retrieved": {"retrieved_node_ids": ()},
+      "wrong derived": {"retrieved_node_ids": ("Maria Lopez::node_9",)},
+      "not consumed": {"consumed_node_ids": ()},
+      "broken lineage": {"lineage_preserved_after_hydration": False},
+    }
+    for name, changed in cases.items():
+      with self.subTest(name=name):
+        values = {**valid, **changed}
+        self.assertFalse(subject._classify_causal_social_memory(
+          **values)["causal_link_verified"])
+
+  def test_bilateral_lineage_requires_both_actors(self):
+    snapshot = subject._social_memory_snapshot({
+      "Maria Lopez": self._nodes()})
+    self.assertFalse(snapshot["bilateral_chat_lineage_present"])
+
+  def test_bilateral_lineage_requires_derived_event(self):
+    actors = self._bilateral_nodes()
+    del actors["Maria Lopez"]["node_2"]
+    snapshot = subject._social_memory_snapshot(actors)
+    self.assertFalse(snapshot["bilateral_chat_lineage_present"])
+
+  def test_bilateral_lineage_requires_event_to_reference_chat(self):
+    actors = self._bilateral_nodes()
+    actors["Maria Lopez"]["node_2"].filling = ["node_999"]
+    snapshot = subject._social_memory_snapshot(actors)
+    self.assertFalse(snapshot["bilateral_chat_lineage_present"])
+
+  def test_actor_local_node_id_collisions_preserve_bilateral_lineage(self):
+    snapshot = subject._social_memory_snapshot(self._bilateral_nodes())
+    self.assertTrue(snapshot["bilateral_chat_lineage_present"])
+    self.assertEqual(
+      ["Klaus Mueller::node_2", "Maria Lopez::node_2"],
+      sorted(
+        item["node_ref"]
+        for actor in snapshot["actors"].values()
+        for item in actor["derived_event_nodes"]))
+
+  def test_bilateral_lineage_requires_expected_chat_participant(self):
+    actors = self._bilateral_nodes()
+    actors["Klaus Mueller"]["node_1"].object = "Isabella Rodriguez"
+    snapshot = subject._social_memory_snapshot(actors)
+    self.assertFalse(snapshot["bilateral_chat_lineage_present"])
+
+
 class ModernRunnerOfflineTests(unittest.TestCase):
   def setUp(self):
     self.temporary = tempfile.TemporaryDirectory()
@@ -139,6 +360,28 @@ class ModernRunnerOfflineTests(unittest.TestCase):
 
   def tearDown(self):
     self.temporary.cleanup()
+
+  def _create_persisted_run(self, name="resume-source"):
+    return subject.run_modern_smallville(
+      subject.ModernRunConfig(
+        run_name=name, ticks=5, cost_ceiling_usd=Decimal("0.05")),
+      adapter=ModernTickFakeAdapter(), runtime_root=self.runtime_root)
+
+  def _create_causal_source(self, name):
+    return subject.run_modern_smallville(
+      subject.ModernRunConfig(
+        run_name=name, ticks=2,
+        cognitive_actors=subject.VISIBLE_ACTORS, passive_actors=(),
+        controlled_proximity=True, cost_ceiling_usd=Decimal("0.05")),
+      adapter=NaturalConversationFakeAdapter(), runtime_root=self.runtime_root)
+
+  def _prepare_causal_source(self, source_result, continuation_name):
+    return subject._prepare_resume_context(
+      subject.ModernResumeConfig(
+        source_run=source_result.run_directory,
+        run_name=continuation_name,
+        observe_causal_social_memory=True),
+      self.runtime_root)
 
   def test_two_real_ticks_save_and_reload_without_network(self):
     adapter = ModernTickFakeAdapter()
@@ -336,6 +579,16 @@ class ModernRunnerOfflineTests(unittest.TestCase):
       self.assertEqual(1, len(memory["new_node_ids"]))
       self.assertTrue(report["embedding_stores"]["saved"][actor][
         "references_valid"])
+      causal_actor = report["causal_resume"]["pre_resume"]["actors"][actor]
+      self.assertEqual(1, len(causal_actor["chat_nodes"]))
+      self.assertEqual(1, len(causal_actor["derived_event_nodes"]))
+      self.assertEqual(
+        causal_actor["chat_node_ids"],
+        causal_actor["derived_event_nodes"][0]["source_chat_node_ids"])
+    self.assertTrue(report["causal_resume"]["pre_resume"][
+      "bilateral_chat_lineage_present"])
+    self.assertTrue(report["causal_resume"][
+      "last_accessed_persistence_gap_detected"])
     self.assertTrue(report["continuity"]["all_checks_passed"])
     self.assertTrue(report["multi_actor_isolation"]["all_checks_passed"])
     self.assertEqual(0, report["reload"]["provider_calls"])
@@ -438,6 +691,198 @@ class ModernRunnerOfflineTests(unittest.TestCase):
           subject.ModernRunConfig(run_name="legacy-rejected"),
           adapter=adapter, runtime_root=self.runtime_root)
 
+  def test_resume_rejects_missing_source_before_provider_use(self):
+    self.runtime_root.mkdir(parents=True)
+    adapter = ModernTickFakeAdapter()
+    with self.assertRaises(subject.ModernRunConfigurationError):
+      subject.run_modern_smallville_resume(
+        subject.ModernResumeConfig(
+          source_run=self.runtime_root / "missing",
+          run_name="missing-continuation"),
+        adapter=adapter, runtime_root=self.runtime_root)
+    self.assertEqual([], adapter.calls)
+
+  def test_resume_preserves_hydrated_state_and_appends_history(self):
+    source_result = self._create_persisted_run()
+    source_report = subject._read_json(
+      source_result.run_directory / "report.json")
+    source_simulation = Path(source_report["artifacts"]["simulation"])
+    old_movement_hashes = {
+      f"{index}.json": subject._file_sha256(
+        source_simulation / "movement" / f"{index}.json")
+      for index in range(5)}
+    old_environment_hashes = {
+      f"{index}.json": subject._file_sha256(
+        source_simulation / "environment" / f"{index}.json")
+      for index in range(6)}
+
+    result = subject.run_modern_smallville_resume(
+      subject.ModernResumeConfig(
+        source_run=source_result.run_directory,
+        run_name="resume-continuation", ticks=5,
+        cost_ceiling_usd=Decimal("0.05")),
+      adapter=ModernTickFakeAdapter(), runtime_root=self.runtime_root)
+
+    self.assertEqual(subject.R1CLI_A2_A_READY_VERDICT, result.verdict)
+    self.assertEqual(5, result.initial_step)
+    self.assertEqual(10, result.final_step)
+    self.assertEqual(
+      source_result.final_time, result.initial_time)
+    self.assertEqual(
+      result.initial_time + datetime.timedelta(seconds=50),
+      result.final_time)
+    self.assertEqual(5, result.movement_count)
+    self.assertTrue(result.save_passed)
+    self.assertTrue(result.reload_passed)
+    self.assertEqual(0, result.legacy_fallback_count)
+
+    report = subject._read_json(result.run_directory / "report.json")
+    resumed_simulation = Path(report["artifacts"]["simulation"])
+    resume = report["resume"]
+    self.assertEqual("STANFORD_FORK_COPY", resume["continuation_strategy"])
+    self.assertEqual(0, resume["hydration_provider_calls"])
+    self.assertTrue(resume["history_preserved"])
+    self.assertTrue(resume["cognitive_state_preserved"])
+    self.assertTrue(resume["hydration"]["step_retained"])
+    self.assertTrue(resume["hydration"]["time_retained"])
+    self.assertTrue(resume["hydration"]["all_checks_passed"])
+    actor_checks = resume["hydration"]["actors"][subject.COGNITIVE_ACTOR]
+    self.assertTrue(actor_checks["all_checks_passed"])
+    self.assertTrue(all(actor_checks.values()))
+
+    movement = report["movement_integrity"]
+    self.assertEqual(10, movement["saved_frame_count"])
+    self.assertEqual(10, movement["reload_frame_count"])
+    self.assertEqual(old_movement_hashes, movement["prior_frame_hashes"])
+    self.assertEqual(
+      {f"{index}.json" for index in range(5, 10)},
+      set(movement["frame_hashes"]))
+    for name, expected_hash in old_movement_hashes.items():
+      self.assertEqual(
+        expected_hash,
+        subject._file_sha256(resumed_simulation / "movement" / name))
+      self.assertEqual(
+        expected_hash,
+        subject._file_sha256(source_simulation / "movement" / name))
+    for name, expected_hash in old_environment_hashes.items():
+      self.assertEqual(
+        expected_hash,
+        subject._file_sha256(resumed_simulation / "environment" / name))
+      self.assertEqual(
+        expected_hash,
+        subject._file_sha256(source_simulation / "environment" / name))
+
+    source_actor = source_report["actors"][subject.COGNITIVE_ACTOR]["after"]
+    resumed_actor = report["actors"][subject.COGNITIVE_ACTOR]["before"]
+    for field in (
+        "scratch_hash", "associative_memory_hash", "spatial_memory_hash",
+        "daily_plan_hash", "schedule_hash", "action_hash",
+        "memory_node_count", "embedding_count", "chat_count"):
+      self.assertEqual(source_actor[field], resumed_actor[field], field)
+    planning = report["telemetry"]["by_actor"][
+      subject.COGNITIVE_ACTOR]["planning_callers"]
+    self.assertEqual(0, planning["wake_up_hour"])
+    self.assertEqual(0, planning["daily_plan"])
+    self.assertEqual(0, planning["generate_hourly_schedule"])
+
+  def test_causal_resume_hydrates_bilateral_lineage_without_provider_calls(self):
+    source_result = self._create_causal_source("causal-source")
+
+    result = subject.run_modern_smallville_resume(
+      subject.ModernResumeConfig(
+        source_run=source_result.run_directory,
+        run_name="causal-continuation", ticks=1,
+        cost_ceiling_usd=Decimal("0.05"),
+        observe_causal_social_memory=True),
+      adapter=ModernTickFakeAdapter(), runtime_root=self.runtime_root)
+
+    self.assertEqual(subject.R1CLI_A2_B_PATH_NOT_REACHED_VERDICT,
+                     result.verdict, repr(result))
+    report = subject._read_json(result.run_directory / "report.json")
+    causal = report["causal_resume"]
+    self.assertTrue(causal["observation_enabled"])
+    self.assertTrue(causal["hydration"]["chat_nodes_preserved"])
+    self.assertTrue(causal["hydration"]["derived_nodes_preserved"])
+    self.assertTrue(causal["hydration"]["lineage_preserved"])
+    self.assertEqual(0, causal["hydration"]["provider_calls"])
+    self.assertTrue(causal["raw_social_memory_persisted"])
+    self.assertTrue(causal["derived_social_memory_persisted"])
+    self.assertFalse(causal["causal_link_verified"])
+    self.assertEqual("NOT_FULLY_GUARANTEED",
+                     causal["ranking_state_fidelity"])
+
+  def test_chained_causal_source_uses_final_persisted_lineage(self):
+    source = self._create_causal_source("chain-source")
+    chained = subject.run_modern_smallville_resume(
+      subject.ModernResumeConfig(
+        source_run=source.run_directory, run_name="chain-middle", ticks=1,
+        cost_ceiling_usd=Decimal("0.05"),
+        observe_causal_social_memory=True),
+      adapter=ModernTickFakeAdapter(), runtime_root=self.runtime_root)
+    report = subject._read_json(chained.run_directory / "report.json")
+    self.assertFalse(report["interaction"]["bilateral_memory"]["saved"])
+    source_hash = subject._tree_sha256(chained.run_directory)
+
+    context = self._prepare_causal_source(chained, "chain-target")
+
+    self.assertTrue(
+      context.causal_social_memory["bilateral_chat_lineage_present"])
+    self.assertEqual(source_hash, subject._tree_sha256(chained.run_directory))
+
+  def test_persisted_lineage_overrides_missing_observational_report_section(self):
+    source = self._create_causal_source("report-missing-source")
+    report_path = source.run_directory / "report.json"
+    report = subject._read_json(report_path)
+    report.pop("interaction", None)
+    subject._write_json(report_path, report)
+
+    context = self._prepare_causal_source(source, "report-missing-target")
+
+    self.assertTrue(
+      context.causal_social_memory["bilateral_chat_lineage_present"])
+
+  def test_report_true_does_not_override_invalid_persisted_lineage(self):
+    source = self._create_causal_source("invalid-store-source")
+    report = subject._read_json(source.run_directory / "report.json")
+    self.assertTrue(
+      report["interaction"]["bilateral_memory"]["saved"])
+    simulation = Path(report["artifacts"]["simulation"])
+    nodes_path = (simulation / "personas" / "Klaus Mueller"
+                  / "bootstrap_memory" / "associative_memory" / "nodes.json")
+    nodes = subject._read_json(nodes_path)
+    snapshot = subject._social_memory_actor_snapshot("Klaus Mueller", nodes)
+    derived_id = snapshot["derived_event_nodes"][0]["node_id"]
+    nodes[derived_id]["filling"] = ["node_missing"]
+    subject._write_json(nodes_path, nodes)
+
+    with self.assertRaisesRegex(
+        subject.ModernRunConfigurationError,
+        "lacks bilateral Chat -> Event lineage"):
+      self._prepare_causal_source(source, "invalid-store-target")
+
+  def test_resume_rejects_incompatible_embedding_before_hydration(self):
+    source_result = self._create_persisted_run("embedding-source")
+    source_report = subject._read_json(
+      source_result.run_directory / "report.json")
+    source_simulation = Path(source_report["artifacts"]["simulation"])
+    manifest_path = (
+      source_simulation / "personas" / subject.COGNITIVE_ACTOR
+      / "bootstrap_memory" / "associative_memory"
+      / "embedding_manifest.json")
+    manifest = subject._read_json(manifest_path)
+    manifest["dimensions"] = 3072
+    subject._write_json(manifest_path, manifest)
+    adapter = ModernTickFakeAdapter()
+
+    with self.assertRaisesRegex(
+        subject.ModernRunConfigurationError, "embedding store"):
+      subject.run_modern_smallville_resume(
+        subject.ModernResumeConfig(
+          source_run=source_result.run_directory,
+          run_name="embedding-continuation"),
+        adapter=adapter, runtime_root=self.runtime_root)
+    self.assertEqual([], adapter.calls)
+
 
 class ModernCliTests(unittest.TestCase):
   def test_run_ticks_one_returns_success(self):
@@ -499,6 +944,46 @@ class ModernCliTests(unittest.TestCase):
         side_effect=subject.ModernRunConfigurationError("invalid")):
       self.assertEqual(2, subject.main([
         "run", "--ticks", "1", "--name", "valid-name"]))
+
+  def test_resume_subcommand_builds_dedicated_config(self):
+    now = datetime.datetime(2026, 8, 7, 11, 37, 0)
+    result = subject.ModernRunResult(
+      verdict=subject.R1CLI_A2_A_READY_VERDICT,
+      run_directory=Path(".runtime/live-runs/continued"),
+      cognitive_actors=(subject.COGNITIVE_ACTOR,),
+      passive_actors=subject.PASSIVE_ACTORS,
+      completed_ticks=5, movement_count=5,
+      initial_step=5, final_step=10, initial_time=now,
+      final_time=now + datetime.timedelta(seconds=50),
+      logical_calls=0, physical_attempts=0, input_tokens=0,
+      output_tokens=0, total_cost_usd=Decimal("0"),
+      cost_ceiling_usd=Decimal("0.05"), save_passed=True,
+      reload_passed=True,
+      actor_move_counts=((subject.COGNITIVE_ACTOR, 5),
+                         (subject.PASSIVE_ACTORS[0], 0),
+                         (subject.PASSIVE_ACTORS[1], 0)),
+      passive_provider_calls=0, passive_memory_mutations=0,
+      legacy_fallback_count=0, retry_count=0)
+    with patch.object(
+        subject, "run_modern_smallville_resume",
+        return_value=result) as runner:
+      self.assertEqual(0, subject.main([
+        "resume", "--from", ".runtime/live-runs/source",
+        "--ticks", "5", "--name", "continued",
+        "--cost-ceiling", "0.05",
+        "--observe-causal-social-memory"]))
+    config = runner.call_args.args[0]
+    self.assertIsInstance(config, subject.ModernResumeConfig)
+    self.assertEqual(Path(".runtime/live-runs/source"), config.source_run)
+    self.assertEqual("continued", config.run_name)
+    self.assertEqual(5, config.ticks)
+    self.assertTrue(config.observe_causal_social_memory)
+
+  def test_resume_invalid_ticks_uses_argparse_exit_code_two(self):
+    with self.assertRaises(SystemExit) as caught:
+      subject.main([
+        "resume", "--from", ".runtime/live-runs/source", "--ticks", "0"])
+    self.assertEqual(2, caught.exception.code)
 
 
 if __name__ == "__main__":

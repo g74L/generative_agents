@@ -29,6 +29,7 @@ from persona.prompt_template.chat_runtime import (
   get_modern_chat_runtime_config,
   run_modern_chat,
   use_modern_chat_runtime,
+  validate_modern_chat_caller,
 )
 from persona.prompt_template import gpt_structure, run_gpt_prompt
 from persona.prompt_template.cost_ledger import (
@@ -39,9 +40,11 @@ from persona.prompt_template.cost_ledger import (
   summarize_cost_ledger,
 )
 from persona.prompt_template.embedding_runtime import (
+  M2_EMBEDDING_CALLER_ALLOWLIST,
   TEXT_EMBEDDING_3_SMALL_MODEL,
   build_modern_embedding_runtime_config,
   use_embedding_runtime,
+  validate_modern_embedding_caller,
 )
 from persona.prompt_template.llm_provider import (
   CHAT,
@@ -1039,9 +1042,9 @@ class ModernChatRuntimeTests(unittest.TestCase):
     self.assertEqual(("event_poignancy", PLANNING),
                      (ledger.caller_id, ledger.cognitive_category))
     self.assertEqual(
-      ("pronunciatio", "act_obj_desc", "event_poignancy",
+      ("pronunciatio", "act_obj_desc", "event_poignancy", "focal_pt",
        "agent_chat_summarize_relationship", "iterative_chat_utterance",
-       "summarize_conversation", "chat_poignancy"),
+       "summarize_conversation", "chat_poignancy", "memo_on_convo"),
       M5_REPLAY_CALLER_ALLOWLIST)
 
   def test_115_pronunciatio_micro_run_is_one_call_without_legacy_detection(self):
@@ -1095,13 +1098,43 @@ class ModernChatRuntimeTests(unittest.TestCase):
       self.assertNotIn(marker, repr(get_telemetry()))
     self.assertNotIn("state", repr(get_telemetry()))
 
-  def test_118_act_obj_desc_invalid_response_keeps_three_attempts(self):
+  def test_118_act_obj_desc_exhaustion_returns_typed_failsafe(self):
+    # R1CHAT-P5 / live B7 (Klaus Mueller, step 348): 3 physical attempts, all
+    # invalid, must restore the historical fail-safe ("<object> is idle")
+    # instead of the implicit ``None`` that produced 'NoneType' object is not
+    # subscriptable in plan.py's ``run_gpt_prompt_act_obj_desc(...)[0]``
+    # consumer.
     adapter = FakeModernChatAdapter(
       response("not-json"), response("still-invalid"), response("bad"))
-    self.assertIsNone(self._act_obj_desc(adapter))
+    persona = SimpleNamespace(name="Isabella Rodriguez")
+    with self._backend_workdir(), redirect_stdout(io.StringIO()), (
+        use_modern_chat_runtime(self.config(), adapter)):
+      result = run_gpt_prompt.run_gpt_prompt_act_obj_desc(
+        "bed", "sleeping", persona)
+    self.assertIsNotNone(result)
+    self.assertEqual(("bed is idle", "bed is idle"), (result[0], result[1][4]))
+    self.assertIs(type(result[0]), str)
     self.assertEqual(3, len(adapter.calls))
     self.assertEqual(1, len({event.logical_call_id
                             for event in get_telemetry()}))
+    self.assertEqual(2, sum(
+      1 for event in get_telemetry() if event.physical_attempt > 1))
+
+  def test_118b_act_obj_desc_consumer_survives_retry_exhaustion(self):
+    # Exercises the exact expression from plan.py's generate_act_obj_desc --
+    # run_gpt_prompt_act_obj_desc(...)[0] -- the real call site that raised
+    # 'NoneType' object is not subscriptable in live run
+    # r1cli-a2-b-process-b7 (Klaus Mueller, step 348, caller=act_obj_desc).
+    from persona.cognitive_modules import plan as plan_module
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response("still-invalid"), response("bad"))
+    persona = SimpleNamespace(name="Klaus Mueller")
+    with self._backend_workdir(), redirect_stdout(io.StringIO()), (
+        use_modern_chat_runtime(self.config(), adapter)):
+      desc = plan_module.generate_act_obj_desc(
+        "pool table", "playing pool", persona)
+    self.assertEqual("pool table is idle", desc)
+    self.assertIs(type(desc), str)
 
   def test_119_act_obj_desc_invalid_then_valid_retries_semantically(self):
     adapter = FakeModernChatAdapter(
@@ -1160,9 +1193,9 @@ class ModernChatRuntimeTests(unittest.TestCase):
       "🎨", self._pronunciatio(
         FakeModernChatAdapter(response('{"output":"🎨"}'))))
     self.assertEqual(
-      ("pronunciatio", "act_obj_desc", "event_poignancy",
+      ("pronunciatio", "act_obj_desc", "event_poignancy", "focal_pt",
        "agent_chat_summarize_relationship", "iterative_chat_utterance",
-       "summarize_conversation", "chat_poignancy"),
+       "summarize_conversation", "chat_poignancy", "memo_on_convo"),
       M5_REPLAY_CALLER_ALLOWLIST)
 
   def test_125_event_poignancy_preserves_prompt_and_privacy(self):
@@ -1176,14 +1209,35 @@ class ModernChatRuntimeTests(unittest.TestCase):
     self.assertNotIn(marker, repr(get_telemetry()))
     self.assertNotIn('{"output":"6"}', repr(get_telemetry()))
 
-  def test_126_event_poignancy_invalid_output_keeps_three_attempts(self):
+  def test_126_event_poignancy_exhaustion_returns_typed_failsafe(self):
+    # R1CHAT-P4 / live B4 (Maria Lopez, step 107): 3 physical attempts, all
+    # invalid, must restore the historical fail-safe (4) instead of the
+    # implicit ``None`` that produced 'NoneType' object is not subscriptable
+    # in reflect.py's ``run_gpt_prompt_event_poignancy(...)[0]`` consumer.
     adapter = FakeModernChatAdapter(
       response("not-json"), response('{"output":"not-an-int"}'),
       response("still-invalid"))
-    self.assertIsNone(self._event_poignancy(adapter))
+    scratch = SimpleNamespace(
+      name="Maria Lopez", get_str_iss=lambda: "identity")
+    with self._backend_workdir(), redirect_stdout(io.StringIO()), (
+        use_modern_chat_runtime(self.config(), adapter)):
+      result = run_gpt_prompt.run_gpt_prompt_event_poignancy(
+        SimpleNamespace(scratch=scratch), "event")
+    self.assertIsNotNone(result)
+    self.assertEqual((4, 4), (result[0], result[1][4]))
+    self.assertIs(type(result[0]), int)
     self.assertEqual(3, len(adapter.calls))
     self.assertEqual(1, len({event.logical_call_id
                             for event in get_telemetry()}))
+    self.assertEqual(2, sum(
+      1 for event in get_telemetry() if event.physical_attempt > 1))
+
+  def test_126b_event_poignancy_policy_error_still_hard_fails(self):
+    adapter = FakeModernChatAdapter(
+      LLMAuthenticationError("denied"), response('{"output":"must-not-run"}'))
+    with self.assertRaises(LLMAuthenticationError):
+      self._event_poignancy(adapter)
+    self.assertEqual(1, len(adapter.calls))
 
   def test_127_event_poignancy_invalid_then_valid_preserves_parser(self):
     adapter = FakeModernChatAdapter(
@@ -1214,6 +1268,109 @@ class ModernChatRuntimeTests(unittest.TestCase):
     self.assertNotIn("gpt-3.5-turbo", [event.model_or_engine
                                       for event in events])
     dns.assert_not_called()
+
+  def test_129b_event_poignancy_consumer_survives_retry_exhaustion(self):
+    # R1CHAT-P4 consumer regression: exercises the exact expression from
+    # reflect.py's generate_poig_score -- run_gpt_prompt_event_poignancy(
+    # persona, description)[0] -- which is the real call site that raised
+    # 'NoneType' object is not subscriptable in live run
+    # r1cli-a2-b-process-b4 (Maria Lopez, step 107, caller=event_poignancy).
+    from persona.cognitive_modules import reflect as reflect_module
+    for event_type in ("event", "thought"):
+      with self.subTest(event_type=event_type):
+        clear_telemetry()
+        adapter = FakeModernChatAdapter(
+          response("not-json"), response('{"output":"not-an-int"}'),
+          response("still-invalid"))
+        scratch = SimpleNamespace(
+          name="Maria Lopez", get_str_iss=lambda: "identity")
+        persona = SimpleNamespace(scratch=scratch)
+        with self._backend_workdir(), redirect_stdout(io.StringIO()), (
+            use_modern_chat_runtime(self.config(), adapter)):
+          score = reflect_module.generate_poig_score(
+            persona, event_type, "a chat happened")
+        self.assertEqual(4, score)
+        self.assertIs(type(score), int)
+
+  def _focal_pt(self, adapter, statements="Klaus is reading\n", n=3,
+               persona_name="Klaus Mueller"):
+    persona = SimpleNamespace(name=persona_name)
+    with self._backend_workdir(), redirect_stdout(io.StringIO()), (
+        use_modern_chat_runtime(self.config(), adapter)):
+      result = run_gpt_prompt.run_gpt_prompt_focal_pt(persona, statements, n)
+      return result
+
+  def test_129c_focal_pt_authorized_attribution(self):
+    # R1CHAT-P7 / live B8 (Klaus Mueller, tick 560, caller mislabeled
+    # event_poignancy by the failure-report fallback): the real culprit was
+    # run_gpt_prompt_focal_pt calling ChatGPT_safe_generate_response with no
+    # use_modern_chat_caller wrapper at all, so the modern runtime received
+    # caller_id=None and the guard fail-closed with
+    # ModernChatCallerNotAllowedError. This must now be attributed as
+    # "focal_pt" and authorized.
+    adapter = FakeModernChatAdapter(response(
+      '{"output": "[\\"What should Klaus do for lunch\\", '
+      '\\"Does Klaus like tea\\", \\"Who is Klaus\\"]"}'))
+    result = self._focal_pt(adapter)
+    output, metadata = result
+    self.assertEqual(
+      ["What should Klaus do for lunch", "Does Klaus like tea",
+       "Who is Klaus"], output)
+    event = get_telemetry()[0]
+    self.assertEqual(("focal_pt", CHAT, M5_CHAT_MODEL), (
+      event.caller_id, event.operation, event.model_or_engine))
+    self.assertEqual((M5_CHAT_MODEL, 0, 15, None), (
+      adapter.calls[0]["model"], adapter.calls[0]["temperature"],
+      adapter.calls[0]["max_tokens"], adapter.calls[0]["stop"]))
+    self.assertIn("focal_pt", M5_REPLAY_CALLER_ALLOWLIST)
+
+  def test_129d_focal_pt_return_contract_preserved(self):
+    adapter = FakeModernChatAdapter(response(
+      '{"output": "[\\"a\\", \\"b\\", \\"c\\"]"}'))
+    output, metadata = self._focal_pt(adapter)
+    self.assertEqual(["a", "b", "c"], output)
+    self.assertIs(type(output), list)
+    self.assertEqual(5, len(metadata))
+    self.assertEqual(output, metadata[0])
+
+  def test_129e_focal_pt_exhaustion_returns_typed_failsafe(self):
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response("still-invalid"), response("bad"))
+    output, metadata = self._focal_pt(adapter, n=3)
+    self.assertIsNotNone(output)
+    self.assertEqual(["Who am I", "Who am I", "Who am I"], output)
+    self.assertEqual(output, metadata[4])
+    self.assertIs(type(output), list)
+    self.assertEqual(3, len(adapter.calls))
+    self.assertEqual(1, len({event.logical_call_id
+                            for event in get_telemetry()}))
+    self.assertEqual(2, sum(
+      1 for event in get_telemetry() if event.physical_attempt > 1))
+
+  def test_129f_focal_pt_consumer_survives_retry_exhaustion(self):
+    # Exercises the exact expression from reflect.py's generate_focal_points
+    # -- run_gpt_prompt_focal_pt(persona, statements, n)[0] -- the real
+    # consumer reached from reflection_trigger -> run_reflect that crashed
+    # live in r1cli-a2-b-process-b8. reflect.py itself is not modified.
+    from persona.cognitive_modules import reflect as reflect_module
+    node_a = SimpleNamespace(last_accessed=1, embedding_key="Klaus reads")
+    node_b = SimpleNamespace(last_accessed=2, embedding_key="Klaus walks")
+    persona = SimpleNamespace(
+      a_mem=SimpleNamespace(seq_event=[node_a, node_b], seq_thought=[]),
+      scratch=SimpleNamespace(importance_ele_n=2))
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response("still-invalid"), response("bad"))
+    with self._backend_workdir(), redirect_stdout(io.StringIO()), (
+        use_modern_chat_runtime(self.config(), adapter)):
+      focal_points = reflect_module.generate_focal_points(persona, 3)
+    self.assertEqual(["Who am I", "Who am I", "Who am I"], focal_points)
+
+  def test_129g_focal_pt_policy_error_still_hard_fails(self):
+    adapter = FakeModernChatAdapter(
+      LLMAuthenticationError("denied"), response('{"output":"must-not-run"}'))
+    with self.assertRaises(LLMAuthenticationError):
+      self._focal_pt(adapter)
+    self.assertEqual(1, len(adapter.calls))
 
   def _summarize_relationship(self, adapter, statements="shared context"):
     persona = SimpleNamespace(scratch=SimpleNamespace(name="Maria Lopez"))
@@ -1394,6 +1551,199 @@ class ModernChatRuntimeTests(unittest.TestCase):
       response('{"Maria Lopez":"done","Did the conversation end?":true}'))
     self.assertTrue(self._iterative_utterance(adapter)["end"])
     self.assertEqual(2, len(adapter.calls))
+
+  def _chat_poignancy_result(self, adapter, event="synthetic chat",
+                             persona_name="Klaus Mueller"):
+    scratch = SimpleNamespace(
+      name=persona_name, get_str_iss=lambda: "synthetic identity")
+    with self._backend_workdir(), redirect_stdout(io.StringIO()), (
+        use_modern_chat_runtime(self.config(), adapter)):
+      return run_gpt_prompt.run_gpt_prompt_chat_poignancy(
+        SimpleNamespace(scratch=scratch), event)
+
+  def test_143_chat_poignancy_historical_string_output_is_typed(self):
+    result = self._chat_poignancy_result(
+      FakeModernChatAdapter(response('{"output":"7"}')))
+    self.assertEqual(7, result[0])
+    self.assertIs(type(result[0]), int)
+
+  def test_144_chat_poignancy_modern_numeric_json_is_typed(self):
+    result = self._chat_poignancy_result(
+      FakeModernChatAdapter(response('{"output":7}')))
+    self.assertEqual(7, result[0])
+    self.assertIs(type(result[0]), int)
+
+  def test_145_chat_poignancy_invalid_then_valid_retries_parser(self):
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response('{"output":8}'))
+    result = self._chat_poignancy_result(adapter)
+    self.assertEqual(8, result[0])
+    self.assertEqual(2, len(adapter.calls))
+    self.assertEqual(1, len({event.logical_call_id
+                            for event in get_telemetry()}))
+
+  def test_146_chat_poignancy_exhaustion_returns_typed_failsafe(self):
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response('{"output":"not-an-int"}'),
+      response("still-invalid"))
+    result = self._chat_poignancy_result(adapter)
+    self.assertIsNotNone(result)
+    self.assertEqual((4, 4), (result[0], result[1][4]))
+    self.assertIs(type(result[0]), int)
+    self.assertEqual(3, len(adapter.calls))
+
+  def test_147_chat_poignancy_preserves_actual_transport_and_attribution(self):
+    adapter = FakeModernChatAdapter(response('{"output":6}'))
+    context = LLMReplayContext(
+      cognitive_category="PERCEPTION", actor_id="Klaus Mueller",
+      simulation_id="offline-chat-poignancy", simulation_step=1)
+    with use_llm_replay_context(context), patch.object(
+        gpt_structure, "chat_completion",
+        side_effect=AssertionError("legacy Chat reached")) as legacy:
+      result = self._chat_poignancy_result(adapter)
+    self.assertEqual(6, result[0])
+    self.assertEqual((M5_CHAT_MODEL, 0, None, None), (
+      adapter.calls[0]["model"], adapter.calls[0]["temperature"],
+      adapter.calls[0]["max_tokens"], adapter.calls[0]["stop"]))
+    self.assertEqual(15, result[1][2]["max_tokens"])
+    event = get_telemetry()[0]
+    self.assertEqual(
+      ("chat_poignancy", CHAT, M5_CHAT_MODEL, "Klaus Mueller",
+       "offline-chat-poignancy", 1),
+      (event.caller_id, event.operation, event.model_or_engine,
+       event.actor_id, event.simulation_id, event.simulation_step))
+    legacy.assert_not_called()
+
+  def test_148_chat_poignancy_policy_error_still_hard_fails(self):
+    adapter = FakeModernChatAdapter(
+      LLMAuthenticationError("denied"), response('{"output":6}'))
+    with self.assertRaises(LLMAuthenticationError):
+      self._chat_poignancy_result(adapter)
+    self.assertEqual(1, len(adapter.calls))
+
+  def _memo_on_convo_result(self, adapter,
+                            all_utt="Maria Lopez: Hi\nKlaus Mueller: Hi\n",
+                            persona_name="Maria Lopez", config=None):
+    scratch = SimpleNamespace(name=persona_name)
+    persona = SimpleNamespace(name=persona_name, scratch=scratch)
+    with patch.object(run_gpt_prompt, "debug", False), (
+        self._backend_workdir()), redirect_stdout(io.StringIO()), (
+        use_modern_chat_runtime(config or self.config(), adapter)):
+      return run_gpt_prompt.run_gpt_prompt_memo_on_convo(persona, all_utt)
+
+  def test_149_memo_on_convo_uses_attributed_modern_chat(self):
+    adapter = FakeModernChatAdapter(
+      response('{"output": "An interesting evening."}'))
+    context = LLMReplayContext(
+      cognitive_category="WORLD_TICK", actor_id="Maria Lopez",
+      simulation_id="r1chat-p3-offline", simulation_step=107)
+    with use_llm_replay_context(context):
+      output, unused_extras = self._memo_on_convo_result(adapter)
+    self.assertEqual("An interesting evening.", output)
+    event = get_telemetry()[0]
+    self.assertEqual(
+      ("memo_on_convo", CHAT, M5_CHAT_MODEL, "Maria Lopez",
+       "r1chat-p3-offline", 107),
+      (event.caller_id, event.operation, event.model_or_engine,
+       event.actor_id, event.simulation_id, event.simulation_step))
+
+  def test_150_memo_on_convo_actor_context_is_not_hardcoded(self):
+    adapter = FakeModernChatAdapter(response('{"output": "Klaus seemed busy."}'))
+    context = LLMReplayContext(actor_id="Klaus Mueller", simulation_step=42)
+    with use_llm_replay_context(context):
+      self._memo_on_convo_result(adapter, persona_name="Klaus Mueller")
+    event = get_telemetry()[0]
+    self.assertEqual("memo_on_convo", event.caller_id)
+    self.assertEqual("Klaus Mueller", event.actor_id)
+    self.assertEqual(42, event.simulation_step)
+
+  def test_151_memo_on_convo_anonymous_chat_caller_fails_closed(self):
+    with self.assertRaises(ModernChatCallerNotAllowedError):
+      validate_modern_chat_caller(None)
+
+  def test_152_memo_on_convo_unknown_chat_caller_fails_closed(self):
+    with self.assertRaises(ModernChatCallerNotAllowedError):
+      validate_modern_chat_caller("unknown")
+
+  def test_153_memo_on_convo_authorized_caller_passes_policy(self):
+    self.assertEqual(
+      "memo_on_convo", validate_modern_chat_caller("memo_on_convo"))
+    self.assertIn("memo_on_convo", M5_REPLAY_CALLER_ALLOWLIST)
+
+  def test_154_memo_on_convo_prompt_and_parameters_are_unchanged(self):
+    adapter = FakeModernChatAdapter(
+      response('{"output": "Noted the market stall."}'))
+    output, extras = self._memo_on_convo_result(adapter)
+    returned_output, prompt, gpt_param, prompt_input, fail_safe = extras
+    self.assertEqual(output, returned_output)
+    self.assertEqual({
+      "engine": "text-davinci-002", "max_tokens": 15, "temperature": 0,
+      "top_p": 1, "stream": False, "frequency_penalty": 0,
+      "presence_penalty": 0, "stop": None}, gpt_param)
+    self.assertEqual("...", fail_safe)
+    self.assertEqual(
+      ["Maria Lopez: Hi\nKlaus Mueller: Hi\n", "Maria Lopez",
+       "Maria Lopez", "Maria Lopez"], prompt_input)
+    self.assertIsInstance(prompt, str)
+    self.assertEqual((M5_CHAT_MODEL, 0, 15, None), (
+      adapter.calls[0]["model"], adapter.calls[0]["temperature"],
+      adapter.calls[0]["max_tokens"], adapter.calls[0]["stop"]))
+
+  def test_155_memo_on_convo_chatgpt_exhaustion_falls_through_unchanged(self):
+    """Attribution must not alter the historical fallthrough: exhausting the
+    ChatGPT branch (repeat=3, unchanged) still hands off to the existing,
+    already-attributed legacy CompletionCompat branch below with the exact
+    same prompt/gpt_param/fail_safe -- this wave touches only the ChatGPT
+    branch that used to reach the modern runtime anonymously."""
+    adapter = FakeModernChatAdapter(
+      response("not-json"), response("still-not-json"), response("nope"))
+    captured = {}
+
+    def fake_legacy_fallback(prompt, gpt_param, repeat, fail_safe,
+                             func_validate, func_clean_up, caller_id=None):
+      captured.update(
+        prompt=prompt, gpt_param=dict(gpt_param), fail_safe=fail_safe,
+        caller_id=caller_id)
+      return fail_safe
+
+    with patch.object(run_gpt_prompt, "safe_generate_response",
+                      side_effect=fake_legacy_fallback):
+      output, extras = self._memo_on_convo_result(adapter)
+
+    self.assertEqual(3, len(adapter.calls))
+    self.assertEqual("memo_on_convo", captured["caller_id"])
+    self.assertEqual("...", captured["fail_safe"])
+    self.assertEqual("...", output)
+    self.assertEqual({
+      "engine": "text-davinci-003", "max_tokens": 50, "temperature": 0,
+      "top_p": 1, "stream": False, "frequency_penalty": 0,
+      "presence_penalty": 0, "stop": None}, captured["gpt_param"])
+
+  def test_156_memo_on_convo_return_contract_is_a_two_item_tuple(self):
+    adapter = FakeModernChatAdapter(response('{"output": "Kept it brief."}'))
+    result = self._memo_on_convo_result(adapter)
+    self.assertIsInstance(result, tuple)
+    self.assertEqual(2, len(result))
+    output, extras = result
+    self.assertIsInstance(output, str)
+    self.assertIsInstance(extras, list)
+    self.assertEqual(5, len(extras))
+
+  def test_157_both_r1emb_p1_embedding_callers_remain_authorized(self):
+    """R1EMB-P1 regression: planning_thought_on_convo and memo_on_convo are
+    still the only two authorized EMBEDDING callers after this wave's CHAT
+    allowlist change (a distinct allowlist -- adding memo_on_convo to CHAT
+    must not touch or widen the EMBEDDING policy)."""
+    self.assertEqual(
+      ("planning_thought_on_convo", "memo_on_convo"),
+      M2_EMBEDDING_CALLER_ALLOWLIST)
+    self.assertEqual(
+      "planning_thought_on_convo",
+      validate_modern_embedding_caller("planning_thought_on_convo"))
+    self.assertEqual(
+      "memo_on_convo", validate_modern_embedding_caller("memo_on_convo"))
+    with self.assertRaises(ModernChatCallerNotAllowedError):
+      validate_modern_embedding_caller(None)
 
 
 if __name__ == "__main__":

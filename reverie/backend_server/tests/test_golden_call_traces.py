@@ -275,10 +275,14 @@ class GoldenCallTraceTests(unittest.TestCase):
     adapter = _ModernChatAdapter("invalid", "still invalid", "not numeric")
     with redirect_stdout(io.StringIO()), use_modern_chat_runtime(
         build_modern_chat_runtime_config(), adapter):
-      failed_output = run_gpt_prompt.run_gpt_prompt_event_poignancy(
+      failed_output, failed_metadata = run_gpt_prompt.run_gpt_prompt_event_poignancy(
         persona, "Alice reads a letter")
 
-    self.assertIsNone(failed_output)
+    # R1CHAT-P4 / live B4: retry exhaustion must restore the historical
+    # fail-safe (4), not the implicit None that raised
+    # 'NoneType' object is not subscriptable in reflect.py's consumer.
+    self.assertEqual(4, failed_output)
+    self.assertEqual(4, failed_metadata[-1])
     failure_events = get_telemetry()
     self.assertEqual(3, len(failure_events))
     self.assertEqual(1, len({event.logical_call_id
