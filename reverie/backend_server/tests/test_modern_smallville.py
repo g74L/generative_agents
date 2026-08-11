@@ -161,6 +161,89 @@ class ModernResumeConfigTests(unittest.TestCase):
         source_run="persisted-run", run_name="continued-run")
 
 
+class FailureCallerAttributionTests(unittest.TestCase):
+  """R1OBS-P1: a crash must never inherit an unrelated prior caller."""
+
+  @staticmethod
+  def _execution_state():
+    return {"stage": "tick", "actor": "Maria Lopez", "tick": 3}
+
+  @staticmethod
+  def _result():
+    return subject.ModernRunResult(
+      verdict="MODERN_SMALLVILLE_HEADLESS_RUN_FAILED",
+      run_directory=Path("unused"), cognitive_actors=(), passive_actors=(),
+      completed_ticks=0, movement_count=0, initial_step=0, final_step=0,
+      initial_time=None, final_time=None, logical_calls=0,
+      physical_attempts=0, input_tokens=0, output_tokens=0,
+      total_cost_usd=Decimal("0"), cost_ceiling_usd=Decimal("1"),
+      save_passed=False, reload_passed=False, actor_move_counts=(),
+      passive_provider_calls=0, passive_memory_mutations=0,
+      legacy_fallback_count=0, retry_count=0,
+      exception_type="RuntimeError", exception_message="boom")
+
+  def test_exception_caller_beats_previous_telemetry(self):
+    # Case A: the exception itself declares the true crash site (focal_pt);
+    # an unrelated, previously successful caller must not override it.
+    error = subject.ModernDeferredCallerError(
+      "focal_pt", "create_chat", "Maria Lopez", 3)
+    report = subject._build_failure_report(
+      self._execution_state(), self._result(), error)
+    self.assertEqual("focal_pt", report["caller"])
+    self.assertEqual("create_chat", report["operation"])
+
+  def test_missing_caller_does_not_inherit_previous_telemetry(self):
+    # Case B (the regression this wave fixes): the crash carries no
+    # caller of its own, so the reporter must not borrow the caller of
+    # the last successful, unrelated telemetry event (event_poignancy).
+    error = RuntimeError("unrelated failure with no caller attribute")
+    report = subject._build_failure_report(
+      self._execution_state(), self._result(), error)
+    self.assertIsNone(report["caller"])
+    self.assertIsNone(report["operation"])
+
+  def test_no_telemetry_at_all_still_reports_unknown_caller(self):
+    # Case C: no telemetry has ever been recorded; the reporter must
+    # still degrade to an explicit unknown rather than raise.
+    error = RuntimeError("first call in the run failed outright")
+    report = subject._build_failure_report(
+      self._execution_state(), self._result(), error)
+    self.assertIsNone(report["caller"])
+    self.assertIsNone(report["operation"])
+
+  def test_execution_state_fields_are_untouched_by_the_fix(self):
+    # Case D: stage/actor/tick come from the authoritative current
+    # execution context and must survive the caller-attribution fix
+    # unchanged.
+    error = RuntimeError("boom")
+    report = subject._build_failure_report(
+      self._execution_state(), self._result(), error)
+    self.assertEqual("tick", report["stage"])
+    self.assertEqual("Maria Lopez", report["actor"])
+    self.assertEqual(3, report["tick"])
+    self.assertEqual("RuntimeError", report["exception_type"])
+    self.assertEqual("boom", report["exception_message"])
+
+  def test_no_error_yields_no_failure_section(self):
+    report = subject._build_failure_report(
+      self._execution_state(), self._result(), None)
+    self.assertIsNone(report)
+
+  def test_null_caller_round_trips_through_report_json(self):
+    # Case E: a None caller must serialize as JSON null and read back
+    # as None, matching report.json's on-disk contract.
+    error = RuntimeError("unrelated failure with no caller attribute")
+    failure = subject._build_failure_report(
+      self._execution_state(), self._result(), error)
+    with tempfile.TemporaryDirectory() as tmp:
+      path = Path(tmp) / "report.json"
+      subject._write_json(path, {"failure": failure})
+      self.assertIn('"caller": null', path.read_text(encoding="utf-8"))
+      reloaded = subject._read_json(path)
+      self.assertIsNone(reloaded["failure"]["caller"])
+      self.assertIsNone(reloaded["failure"]["operation"])
+
+
 class CausalSocialMemoryTests(unittest.TestCase):
   @staticmethod
   def _nodes():

@@ -330,6 +330,30 @@ def _normalize(value):
   return value
 
 
+def _build_failure_report(
+    execution_state: dict, result: ModernRunResult,
+    error: Optional[BaseException]) -> Optional[dict]:
+  """Build the "failure" section of a run report, or None if it succeeded.
+
+  Caller/operation are trusted only when the exception itself declares
+  them. The last successful telemetry call is not evidence about an
+  unrelated crash, so it is never used as a caller/operation fallback:
+  an unknown attribution stays unknown instead of borrowing the identity
+  of a previous, unrelated call.
+  """
+  if error is None:
+    return None
+  return {
+    "stage": execution_state["stage"],
+    "actor": execution_state["actor"],
+    "tick": execution_state["tick"],
+    "exception_type": result.exception_type,
+    "exception_message": result.exception_message,
+    "caller": getattr(error, "caller", None),
+    "operation": getattr(error, "operation", None),
+  }
+
+
 def _write_json(path: Path, value: Any) -> None:
   temporary = path.with_name(path.name + ".tmp")
   with temporary.open("w", encoding="utf-8") as stream:
@@ -2507,17 +2531,7 @@ def _execute_modern_smallville(
       "by_tick": telemetry_by_tick,
       "attribution_valid": telemetry_attribution_valid,
     },
-    "failure": ({
-      "stage": execution_state["stage"],
-      "actor": execution_state["actor"],
-      "tick": execution_state["tick"],
-      "exception_type": result.exception_type,
-      "exception_message": result.exception_message,
-      "caller": (getattr(error, "caller", None)
-                 or (events[-1].caller_id if events else None)),
-      "operation": (getattr(error, "operation", None)
-                    or (events[-1].operation if events else None)),
-    } if error else None),
+    "failure": _build_failure_report(execution_state, result, error),
     "reload": reloaded_summary,
     "artifacts": {
       "simulation": storage_root / simulation_code,
