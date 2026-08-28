@@ -57,6 +57,7 @@ class AssociativeMemory:
   def __init__(self, f_saved, legacy_assumption_allowed=True,
                runtime_embedding_manifest=None):
     self.id_to_node = dict()
+    self.last_accessed_hydration_gap_detected = False
 
     self.seq_event = []
     self.seq_thought = []
@@ -91,6 +92,12 @@ class AssociativeMemory:
 
       created = datetime.datetime.strptime(node_details["created"], 
                                            '%Y-%m-%d %H:%M:%S')
+      last_accessed = created
+      if "last_accessed" in node_details:
+        last_accessed = datetime.datetime.strptime(
+          node_details["last_accessed"], '%Y-%m-%d %H:%M:%S')
+      else:
+        self.last_accessed_hydration_gap_detected = True
       expiration = None
       if node_details["expiration"]: 
         expiration = datetime.datetime.strptime(node_details["expiration"],
@@ -107,15 +114,21 @@ class AssociativeMemory:
       keywords = set(node_details["keywords"])
       filling = node_details["filling"]
       
+      node = None
       if node_type == "event": 
-        self.add_event(created, expiration, s, p, o, 
-                   description, keywords, poignancy, embedding_pair, filling)
+        node = self.add_event(created, expiration, s, p, o,
+                              description, keywords, poignancy,
+                              embedding_pair, filling)
       elif node_type == "chat": 
-        self.add_chat(created, expiration, s, p, o, 
-                   description, keywords, poignancy, embedding_pair, filling)
+        node = self.add_chat(created, expiration, s, p, o,
+                             description, keywords, poignancy,
+                             embedding_pair, filling)
       elif node_type == "thought": 
-        self.add_thought(created, expiration, s, p, o, 
-                   description, keywords, poignancy, embedding_pair, filling)
+        node = self.add_thought(created, expiration, s, p, o,
+                                description, keywords, poignancy,
+                                embedding_pair, filling)
+      if node is not None:
+        node.last_accessed = last_accessed
 
     kw_strength_load = json.load(open(f_saved + "/kw_strength.json"))
     if "kw_strength_event" in kw_strength_load:
@@ -141,6 +154,8 @@ class AssociativeMemory:
       r[node_id]["depth"] = node.depth
 
       r[node_id]["created"] = node.created.strftime('%Y-%m-%d %H:%M:%S')
+      r[node_id]["last_accessed"] = node.last_accessed.strftime(
+        '%Y-%m-%d %H:%M:%S')
       r[node_id]["expiration"] = None
       if node.expiration: 
         r[node_id]["expiration"] = (node.expiration

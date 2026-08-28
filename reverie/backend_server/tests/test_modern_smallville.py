@@ -613,6 +613,7 @@ class ReflectionThoughtPersistenceRoundTripTests(unittest.TestCase):
     self.assertTrue(check["evidence_preserved"], check)
     self.assertTrue(check["in_seq_thought_after_reload"], check)
     self.assertTrue(check["embedding_available_after_reload"], check)
+    self.assertTrue(check["last_accessed_preserved"], check)
 
   def test_missing_node_reports_not_persisted_honestly(self):
     checks = subject._reflection_round_trip_checks(
@@ -803,6 +804,45 @@ class CausalSocialMemoryTests(unittest.TestCase):
       "Maria Lopez": broken_nodes, "Klaus Mueller": self._nodes()})
     self.assertFalse(subject._compare_social_memory_hydration(
       before, broken)["lineage_preserved"])
+
+  def test_ranking_fidelity_reporting_uses_schema_and_hydration_evidence(self):
+    current = subject._social_memory_snapshot(self._bilateral_nodes())
+    self.assertFalse(current["last_accessed_persistence_gap_detected"])
+    self.assertEqual(
+      "PRESERVED", subject._ranking_state_fidelity(
+        current["last_accessed_persistence_gap_detected"]))
+
+    legacy = {
+      actor: {
+        node_id: {
+          key: value for key, value in vars(node).items()
+          if key != "last_accessed"
+        }
+        for node_id, node in nodes.items()
+      }
+      for actor, nodes in self._bilateral_nodes().items()
+    }
+    legacy_snapshot = subject._social_memory_snapshot(legacy)
+    self.assertTrue(
+      legacy_snapshot["last_accessed_persistence_gap_detected"])
+    self.assertEqual(
+      "NOT_FULLY_GUARANTEED", subject._ranking_state_fidelity(
+        legacy_snapshot["last_accessed_persistence_gap_detected"]))
+
+    mixed = self._bilateral_nodes()
+    mixed["Maria Lopez"]["node_4"] = SimpleNamespace(
+      node_id="node_4", type="event", created=datetime.datetime(
+        2023, 2, 13, 9, 0, 0), embedding_key="unrelated event", filling=[])
+    self.assertTrue(subject._social_memory_snapshot(mixed)[
+      "last_accessed_persistence_gap_detected"])
+
+    hydrated_personas = {
+      actor: SimpleNamespace(a_mem=SimpleNamespace(
+        id_to_node=nodes, last_accessed_hydration_gap_detected=True))
+      for actor, nodes in self._bilateral_nodes().items()
+    }
+    hydrated = subject._loaded_social_memory_snapshot(hydrated_personas)
+    self.assertTrue(hydrated["last_accessed_persistence_gap_detected"])
 
   def test_retrieval_observer_records_without_changing_return(self):
     import persona.cognitive_modules.converse as converse_module
@@ -1169,8 +1209,9 @@ class ModernRunnerOfflineTests(unittest.TestCase):
         causal_actor["derived_event_nodes"][0]["source_chat_node_ids"])
     self.assertTrue(report["causal_resume"]["pre_resume"][
       "bilateral_chat_lineage_present"])
-    self.assertTrue(report["causal_resume"][
+    self.assertFalse(report["causal_resume"][
       "last_accessed_persistence_gap_detected"])
+    self.assertIsNone(report["causal_resume"]["ranking_state_fidelity"])
     self.assertTrue(report["continuity"]["all_checks_passed"])
     self.assertTrue(report["multi_actor_isolation"]["all_checks_passed"])
     self.assertEqual(0, report["reload"]["provider_calls"])
@@ -1390,7 +1431,8 @@ class ModernRunnerOfflineTests(unittest.TestCase):
     self.assertTrue(causal["raw_social_memory_persisted"])
     self.assertTrue(causal["derived_social_memory_persisted"])
     self.assertFalse(causal["causal_link_verified"])
-    self.assertEqual("NOT_FULLY_GUARANTEED",
+    self.assertFalse(causal["last_accessed_persistence_gap_detected"])
+    self.assertEqual("PRESERVED",
                      causal["ranking_state_fidelity"])
 
   def test_chained_causal_source_uses_final_persisted_lineage(self):

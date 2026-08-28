@@ -458,6 +458,10 @@ def _social_memory_actor_snapshot(actor_name, nodes) -> dict[str, Any]:
     node_type = _node_field(node, "type")
     if node_type not in ("chat", "event", "thought"):
       continue
+    if ((isinstance(node, dict) and "last_accessed" not in node)
+        or (not isinstance(node, dict)
+            and not hasattr(node, "last_accessed"))):
+      last_accessed_missing = True
     filling = _node_field(node, "filling") or []
     if not isinstance(filling, (tuple, list)):
       filling = []
@@ -489,10 +493,6 @@ def _social_memory_actor_snapshot(actor_name, nodes) -> dict[str, Any]:
       })
       (derived_events if node_type == "event"
        else derived_thoughts).append(metadata)
-    if ((isinstance(node, dict) and "last_accessed" not in node)
-        or (not isinstance(node, dict)
-            and not hasattr(node, "last_accessed"))):
-      last_accessed_missing = True
   return {
     "chat_nodes": chats,
     "derived_event_nodes": derived_events,
@@ -504,10 +504,15 @@ def _social_memory_actor_snapshot(actor_name, nodes) -> dict[str, Any]:
   }
 
 
-def _social_memory_snapshot(actor_nodes) -> dict[str, Any]:
+def _social_memory_snapshot(actor_nodes,
+                            last_accessed_hydration_gaps=None) -> dict[str, Any]:
+  last_accessed_hydration_gaps = last_accessed_hydration_gaps or {}
   actors = {
     name: _social_memory_actor_snapshot(name, nodes)
     for name, nodes in actor_nodes.items() if name in R1M3C_ACTORS}
+  for name, gap_detected in last_accessed_hydration_gaps.items():
+    if name in actors and gap_detected:
+      actors[name]["last_accessed_not_serialized"] = True
   expected_participant = {
     R1M3C_ACTORS[0]: R1M3C_ACTORS[1],
     R1M3C_ACTORS[1]: R1M3C_ACTORS[0],
@@ -543,6 +548,10 @@ def _social_memory_snapshot(actor_nodes) -> dict[str, Any]:
     "last_accessed_persistence_gap_detected": any(
       actor["last_accessed_not_serialized"] for actor in actors.values()),
   }
+
+
+def _ranking_state_fidelity(gap_detected):
+  return "NOT_FULLY_GUARANTEED" if gap_detected else "PRESERVED"
 
 
 def _compare_social_memory_hydration(pre_resume, hydrated):
@@ -710,9 +719,13 @@ def _persisted_social_memory_snapshot(simulation_root: Path):
 
 
 def _loaded_social_memory_snapshot(personas):
-  return _social_memory_snapshot({
-    name: personas[name].a_mem.id_to_node
-    for name in R1M3C_ACTORS if name in personas})
+  selected = {
+    name: personas[name].a_mem
+    for name in R1M3C_ACTORS if name in personas}
+  return _social_memory_snapshot(
+    {name: memory.id_to_node for name, memory in selected.items()},
+    {name: getattr(memory, "last_accessed_hydration_gap_detected", False)
+     for name, memory in selected.items()})
 
 
 def _persisted_reflection_node(saved_root, actor, node_id):
@@ -734,11 +747,10 @@ def _reflection_round_trip_checks(reflection_thoughts, saved_root,
   """For each reflection Thought the observer saw created, verify it
   survives (a) the on-disk save and (b) a fresh ``ReverieServer`` reload,
   preserving type/poignancy/description/evidence and remaining structurally
-  present in ``seq_thought`` with its embedding available. This proves
-  retrieval *eligibility*, not ranking fidelity -- ``last_accessed`` is not
-  persisted by ``AssociativeMemory.save`` and always resets to ``created``
-  on reload, so recency ranking after reload is a distinct, unverified
-  property left to R1FID."""
+  present in ``seq_thought`` with its embedding available. The persisted and
+  freshly hydrated ``last_accessed`` values are also compared so the report
+  distinguishes structural retrieval eligibility from ranking-state
+  fidelity."""
   checks = []
   for record in reflection_thoughts:
     actor, node_id = record["actor"], record["node_id"]
@@ -767,6 +779,10 @@ def _reflection_round_trip_checks(reflection_thoughts, saved_root,
         reloaded and reloaded_node in reloaded_mem.seq_thought),
       "embedding_available_after_reload": (
         reloaded and reloaded_node.embedding_key in reloaded_mem.embeddings),
+      "last_accessed_preserved": (
+        persisted and "last_accessed" in disk_node and reloaded
+        and _node_created_timestamp(disk_node["last_accessed"])
+        == _node_created_timestamp(reloaded_node.last_accessed)),
     })
   return checks
 
@@ -2580,6 +2596,8 @@ def _execute_modern_smallville(
     check["reloaded"] and check["in_seq_thought_after_reload"]
     and check["embedding_available_after_reload"]
     for check in reflection_round_trip)
+  reflection_ranking_state_preserved = bool(reflection_round_trip) and all(
+    check["last_accessed_preserved"] for check in reflection_round_trip)
   reflection_exclusive_cost = {
     caller: {
       "physical_attempts": sum(
@@ -2629,7 +2647,8 @@ def _execute_modern_smallville(
     "reflection_retrieval_eligible_after_reload":
       reflection_retrieval_eligible_after_reload,
     "ranking_state_fidelity": (
-      "NOT_FULLY_GUARANTEED" if reflection_observation_enabled else None),
+      _ranking_state_fidelity(not reflection_ranking_state_preserved)
+      if reflection_observation_enabled else None),
     "reflection_exclusive_caller_cost": reflection_exclusive_cost,
     "shared_caller_attribution_note": (
       "event_poignancy (perceive.py + reflect.py) and event_triple "
@@ -2659,6 +2678,10 @@ def _execute_modern_smallville(
       causal_pre_resume.get("derived_node_refs", ())),
     retrieved_node_ids=retrieved_derived_refs,
     consumed_node_ids=consumed_derived_refs)
+  causal_last_accessed_gap = (
+    causal_pre_resume.get("last_accessed_persistence_gap_detected", False)
+    if resume is not None else causal_run_snapshot.get(
+      "last_accessed_persistence_gap_detected", False))
   causal_report = {
     "observation_enabled": causal_observation_enabled,
     "pre_resume": (causal_pre_resume if resume is not None
@@ -2686,16 +2709,13 @@ def _execute_modern_smallville(
         for event in last_chat_events),
     },
     **causal_classification,
-    "last_accessed_persistence_gap_detected": (
-      causal_pre_resume.get(
-        "last_accessed_persistence_gap_detected", False)
-      if resume is not None else causal_run_snapshot.get(
-        "last_accessed_persistence_gap_detected", False)),
+    "last_accessed_persistence_gap_detected": causal_last_accessed_gap,
     "candidate_material_preserved": (
       causal_hydration.get("derived_social_memory_persisted", False)
       if causal_observation_enabled else None),
     "ranking_state_fidelity": (
-      "NOT_FULLY_GUARANTEED" if causal_observation_enabled else None),
+      _ranking_state_fidelity(causal_last_accessed_gap)
+      if causal_observation_enabled else None),
   }
   bilateral_encounter = all(any(
     row["observer"] == actor and row["target"] == target

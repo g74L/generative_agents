@@ -1,3 +1,4 @@
+import copy
 import datetime
 from contextlib import redirect_stdout
 import io
@@ -388,6 +389,8 @@ class EmbeddingSpaceManifestTests(unittest.TestCase):
       name: json.loads((source / name).read_text())
       for name in ("embeddings.json", "nodes.json", "kw_strength.json")
     }
+    for node in expected["nodes.json"].values():
+      node["last_accessed"] = node["created"]
     with warnings.catch_warnings():
       warnings.simplefilter("ignore", LegacyEmbeddingSpaceWarning)
       memory = AssociativeMemory(str(source))
@@ -399,6 +402,143 @@ class EmbeddingSpaceManifestTests(unittest.TestCase):
                        json.loads((target / name).read_text()), name)
     self.assertEqual(memory.embedding_space_manifest,
                      read_embedding_manifest(target / EMBEDDING_MANIFEST_FILENAME))
+
+  def test_last_accessed_round_trips_for_event_thought_and_chat(self):
+    store = self.make_store(
+      embeddings={}, nodes={}, manifest=LEGACY_ADA_002_MANIFEST,
+      namespace="last-accessed-source")
+    memory = AssociativeMemory(str(store))
+    created = datetime.datetime(2023, 1, 1, 8, 0, 0)
+    event = memory.add_event(
+      created, None, "Alice", "observed", "the square",
+      "Alice observed the square", {"alice", "square"}, 5,
+      ("event-key", _vector()), [])
+    thought = memory.add_thought(
+      created + datetime.timedelta(minutes=1),
+      created + datetime.timedelta(days=30),
+      "Alice", "reflected on", "the square",
+      "Alice reflected on the square", {"alice", "square"}, 6,
+      ("thought-key", _vector(0.0, 1.0)), [event.node_id])
+    chat = memory.add_chat(
+      created + datetime.timedelta(minutes=2), None,
+      "Alice", "chatted with", "Bob", "Alice chatted with Bob",
+      {"alice", "bob"}, 7, ("chat-key", _vector(0.5, 0.5)),
+      [["Alice", "Hello"], ["Bob", "Hi"]])
+    originals = (event, thought, chat)
+    expected_access = (
+      created + datetime.timedelta(hours=2),
+      created + datetime.timedelta(hours=1, minutes=30),
+      created + datetime.timedelta(hours=1),
+    )
+    for node, last_accessed in zip(originals, expected_access):
+      node.last_accessed = last_accessed
+
+    target = self.root / "last-accessed-saved" / "associative_memory"
+    target.mkdir(parents=True)
+    memory.save(str(target))
+    disk_nodes = json.loads((target / "nodes.json").read_text())
+    expected_fields = {
+      "node_count", "type_count", "type", "depth", "created",
+      "last_accessed", "expiration", "subject", "predicate", "object",
+      "description", "embedding_key", "poignancy", "keywords", "filling",
+    }
+    self.assertTrue(all(set(node) == expected_fields
+                        for node in disk_nodes.values()))
+    self.assertEqual(
+      [value.strftime("%Y-%m-%d %H:%M:%S") for value in expected_access],
+      [disk_nodes[f"node_{index}"]["last_accessed"]
+       for index in range(1, 4)])
+
+    hydrated = AssociativeMemory(str(target))
+    self.assertFalse(hydrated.last_accessed_hydration_gap_detected)
+    preserved_fields = (
+      "node_id", "node_count", "type_count", "type", "depth", "created",
+      "expiration", "subject", "predicate", "object", "description",
+      "embedding_key", "poignancy", "keywords", "filling",
+    )
+    for original, last_accessed in zip(originals, expected_access):
+      reloaded = hydrated.id_to_node[original.node_id]
+      self.assertIsNot(original, reloaded)
+      for field in preserved_fields:
+        self.assertEqual(getattr(original, field), getattr(reloaded, field),
+                         (original.node_id, field))
+      self.assertEqual(last_accessed, reloaded.last_accessed)
+
+  def test_legacy_missing_last_accessed_falls_back_to_created(self):
+    store = self.make_store(manifest=LEGACY_ADA_002_MANIFEST,
+                            namespace="legacy-last-accessed")
+    memory = AssociativeMemory(str(store))
+    node = memory.id_to_node["node_1"]
+    self.assertTrue(memory.last_accessed_hydration_gap_detected)
+    self.assertEqual(node.created, node.last_accessed)
+
+    target = self.root / "legacy-upgraded" / "associative_memory"
+    target.mkdir(parents=True)
+    memory.save(str(target))
+    saved = json.loads((target / "nodes.json").read_text())
+    self.assertEqual(saved["node_1"]["created"],
+                     saved["node_1"]["last_accessed"])
+    self.assertFalse(
+      AssociativeMemory(str(target)).last_accessed_hydration_gap_detected)
+
+  def test_last_accessed_round_trip_preserves_deterministic_ranking_state(self):
+    store = self.make_store(
+      embeddings={}, nodes={}, manifest=LEGACY_ADA_002_MANIFEST,
+      namespace="ranking-fidelity-source")
+    memory = AssociativeMemory(str(store))
+    created_a = datetime.datetime(2023, 1, 1, 8, 0, 0)
+    created_b = datetime.datetime(2023, 1, 1, 9, 0, 0)
+    node_a = memory.add_event(
+      created_a, None, "Alice", "remembers", "A", "memory A",
+      {"alice", "memory"}, 5, ("memory-a", _vector()), [])
+    node_b = memory.add_thought(
+      created_b, None, "Alice", "remembers", "B", "memory B",
+      {"alice", "memory"}, 5, ("memory-b", _vector()), [])
+    node_a.last_accessed = datetime.datetime(2023, 1, 1, 10, 0, 0)
+    node_b.last_accessed = datetime.datetime(2023, 1, 1, 9, 30, 0)
+    pre_save_probe = copy.deepcopy(memory)
+
+    def ranking_inputs(candidate_memory):
+      persona = SimpleNamespace(
+        a_mem=candidate_memory,
+        scratch=SimpleNamespace(
+          curr_time=datetime.datetime(2023, 1, 2, 9, 0, 0),
+          recency_decay=0.99, recency_w=1, relevance_w=1,
+          importance_w=1))
+      candidates = sorted(
+        candidate_memory.seq_event + candidate_memory.seq_thought,
+        key=lambda node: node.last_accessed)
+      recency = retrieve.normalize_dict_floats(
+        retrieve.extract_recency(persona, candidates), 0, 1)
+      return persona, [node.node_id for node in candidates], recency
+
+    pre_persona, pre_candidates, pre_recency = ranking_inputs(pre_save_probe)
+    target = self.root / "ranking-fidelity-saved" / "associative_memory"
+    target.mkdir(parents=True)
+    memory.save(str(target))
+    hydrated = AssociativeMemory(str(target))
+    post_persona, post_candidates, post_recency = ranking_inputs(hydrated)
+
+    self.assertEqual([node_b.node_id, node_a.node_id], pre_candidates)
+    self.assertEqual(pre_candidates, post_candidates)
+    self.assertEqual(pre_recency, post_recency)
+
+    def ranked_ids(persona):
+      reset_embedding_cache()
+      fake = FakeProvider()
+      fake.queue_embedding_response(_vector())
+      with use_provider(fake), redirect_stdout(io.StringIO()):
+        ranked = retrieve.new_retrieve(persona, ["controlled focus"], 2)
+      self.assertEqual(1, len(fake.calls))
+      self.assertTrue(all(
+        node.last_accessed == persona.scratch.curr_time
+        for node in ranked["controlled focus"]))
+      return [node.node_id for node in ranked["controlled focus"]]
+
+    pre_ranked = ranked_ids(pre_persona)
+    post_ranked = ranked_ids(post_persona)
+    self.assertEqual([node_b.node_id, node_a.node_id], pre_ranked)
+    self.assertEqual(pre_ranked, post_ranked)
 
   def test_unknown_store_is_not_promoted_on_save(self):
     store = self.make_store(canonical=False)
