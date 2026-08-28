@@ -1,12 +1,22 @@
 insight_and_evidence_v1.txt
 
 Variables: 
-!<INPUT 0>! -- Numbered list of event/thought statements
-!<INPUT 1>! -- target persona name or "the conversation"
+!<INPUT 0>! -- 1-based numbered list of event/thought statements (1. ..., 2. ..., 3. ...)
+!<INPUT 1>! -- number of requested high-level insights
 
 <commentblockmarker>###</commentblockmarker>
 Input:
 !<INPUT 0>!
 
-What !<INPUT 1>! high-level insights can you infer from the above statements? (example format: insight (because of 1, 5, 3))
-1.
+Infer exactly !<INPUT 1>! high-level insights from the statements above.
+
+Return only the requested insight lines. Number every line and use exactly this grammar:
+1. <insight> (because of 1, 2, 3)
+2. <insight> (because of 4, 5)
+3. <insight> (because of 6)
+
+Inside the required parentheses, use the literal lowercase phrase "because of" followed by at least one positive 1-based statement number. Separate multiple evidence numbers with commas.
+
+Do not add a header such as "Insights:", a section title, an introductory sentence, a closing sentence, or any explanation outside the numbered insights. Do not use markdown code fences, markdown bullets such as "- insight", JSON, YAML, or tables. Do not insert blank lines between insight lines. Do not write anything before the first insight or after the last insight.
+
+Do not use alternative citation syntax such as "because of: 1, 2", "[1, 2]", "(1, 2)", "based on 1, 2", "because of statements 1, 2", or "because of #1, #2".

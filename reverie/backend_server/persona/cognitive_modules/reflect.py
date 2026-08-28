@@ -19,6 +19,15 @@ from persona.prompt_template.gpt_structure import *
 from persona.prompt_template.llm_provider import REFLECTION, embedding_call_context
 from persona.cognitive_modules.retrieve import *
 
+
+class ReflectionInsightContractError(ValueError):
+  """Raised when generated reflection insight lineage is invalid."""
+
+  def __init__(self, message, *, category="STRUCTURE_INVALID"):
+    super().__init__(message)
+    self.category = category
+
+
 def generate_focal_points(persona, n=3): 
   if debug: print ("GNS FUNCTION: <generate_focal_points>")
   
@@ -40,20 +49,44 @@ def generate_insights_and_evidence(persona, nodes, n=5):
   if debug: print ("GNS FUNCTION: <generate_insights_and_evidence>")
 
   statements = ""
-  for count, node in enumerate(nodes): 
+  for count, node in enumerate(nodes, start=1):
     statements += f'{str(count)}. {node.embedding_key}\n'
 
   ret = run_gpt_prompt_insight_and_guidance(persona, statements, n)[0]
 
   print (ret)
-  try: 
+  if not isinstance(ret, dict) or not ret:
+    raise ReflectionInsightContractError(
+      "insight generation returned no valid insight/evidence mapping",
+      category="EMPTY_MAPPING")
 
-    for thought, evi_raw in ret.items(): 
-      evidence_node_id = [nodes[i].node_id for i in evi_raw]
-      ret[thought] = evidence_node_id
-    return ret
-  except: 
-    return {"this is blank": "node_1"} 
+  mapped = {}
+  for thought, evi_raw in ret.items():
+    if not isinstance(thought, str) or not thought.strip():
+      raise ReflectionInsightContractError(
+        "insight text must be non-blank", category="BLANK_INSIGHT")
+    if not isinstance(evi_raw, list) or not evi_raw:
+      raise ReflectionInsightContractError(
+        "each insight must cite at least one evidence number",
+        category=("EVIDENCE_NOT_LIST" if not isinstance(evi_raw, list)
+                  else "EVIDENCE_EMPTY"))
+    if any(type(evidence_number) is not int for evidence_number in evi_raw):
+      raise ReflectionInsightContractError(
+        "evidence numbers must use the 1-based statement range",
+        category="EVIDENCE_NOT_INTEGER")
+    if any(evidence_number < 1 for evidence_number in evi_raw):
+      raise ReflectionInsightContractError(
+        "evidence numbers must use the 1-based statement range",
+        category="EVIDENCE_NON_POSITIVE")
+    if any(evidence_number > len(nodes) for evidence_number in evi_raw):
+      raise ReflectionInsightContractError(
+        "evidence numbers must use the 1-based statement range",
+        category="EVIDENCE_OUT_OF_RANGE")
+    mapped[thought] = [
+      nodes[evidence_number - 1].node_id
+      for evidence_number in evi_raw
+    ]
+  return mapped
 
 
 def generate_action_event_triple(act_desp, persona): 

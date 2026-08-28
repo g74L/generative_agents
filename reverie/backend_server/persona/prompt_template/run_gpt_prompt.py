@@ -9,12 +9,241 @@ import re
 import datetime
 import sys
 import ast
+from contextvars import ContextVar
 
 sys.path.append('../../')
 
 from global_methods import *
 from persona.prompt_template.gpt_structure import *
+from persona.prompt_template.llm_provider import get_telemetry
 from persona.prompt_template.print_prompt import *
+
+
+_last_insight_validation_diagnostics = ContextVar(
+  "last_insight_validation_diagnostics", default=())
+
+
+class InsightResponseContractError(ValueError):
+  """Content-free classification of an insight parser rejection."""
+
+  def __init__(self, category, parsed_insight_count=0):
+    super().__init__(category)
+    self.category = category
+    self.parsed_insight_count = parsed_insight_count
+
+
+def get_last_insight_validation_diagnostics():
+  """Return privacy-safe metadata for the latest insight prompt call."""
+  return [{
+    **record,
+    "shape": dict(record["shape"]),
+  } for record in _last_insight_validation_diagnostics.get()]
+
+
+def _classify_insight_response_shape(gpt_response):
+  """Return content-free structural metadata without changing the response."""
+  if not isinstance(gpt_response, str):
+    effective_lines = []
+    effective_response = ""
+  else:
+    effective_response = gpt_response.strip()
+    effective_lines = (
+      effective_response.splitlines() if effective_response else [])
+
+  def canonical_positive_integer_list(payload):
+    if not re.fullmatch(
+        r"[+-]?\d+(?:\s*,\s*[+-]?\d+)*", payload):
+      return False
+    return all(int(value.strip()) > 0 for value in payload.split(","))
+
+  def canonical_citation(line):
+    row = re.search(r"\(because of\s+([^)]+)\)\.?\s*$", line)
+    return (
+      row is not None
+      and canonical_positive_integer_list(row.group(1).strip()))
+
+  def canonical_line(line):
+    row = re.fullmatch(
+      r"\s*\d+\.\s*(.+?)\s*\(because of\s+([^)]+)\)\.?\s*", line)
+    if row is None or not row.group(1).strip():
+      return False
+    return canonical_positive_integer_list(row.group(2).strip())
+
+  nonblank_lines = [line for line in effective_lines if line.strip()]
+  citation_payloads = []
+  post_parenthesis_suffixes = []
+  for line in nonblank_lines:
+    matches = list(re.finditer(r"\(because of\s+([^)]*)\)", line))
+    if matches:
+      citation_match = matches[-1]
+      citation_payloads.append(citation_match.group(1).strip())
+      post_parenthesis_suffixes.append("".join(
+        character for character in line[citation_match.end():]
+        if not character.isspace()))
+
+  numbered = [
+    re.match(r"\s*\d+\.", line) is not None for line in nonblank_lines]
+  canonical = [canonical_line(line) for line in nonblank_lines]
+  canonical_citations = [
+    canonical_citation(line) for line in nonblank_lines]
+  citation_candidates = [
+    re.search(r"because\s+of|based\s+on", line, re.IGNORECASE) is not None
+    or re.search(r"[\[(][^\]\)\r\n]*\d[^\]\)\r\n]*[\])]\s*$", line)
+    is not None
+    for line in nonblank_lines]
+  canonical_indexes = [
+    index for index, matches in enumerate(canonical) if matches]
+  trailing_noncanonical = 0
+  if canonical_indexes:
+    trailing_noncanonical = sum(
+      1 for matches in canonical[canonical_indexes[-1] + 1:] if not matches)
+
+  first_nonblank = nonblank_lines[0] if nonblank_lines else None
+  wrapper_start = effective_response[:1]
+  wrapper_end = effective_response[-1:] if effective_response else ""
+  json_wrapper = ((wrapper_start, wrapper_end) in (("{", "}"), ("[", "]")))
+  yaml_marker = any(
+    line.strip() in ("---", "...") for line in effective_lines)
+
+  return {
+    "response_line_count": len(effective_lines),
+    "nonblank_line_count": len(nonblank_lines),
+    "blank_line_count": len(effective_lines) - len(nonblank_lines),
+    "numbered_line_count": sum(numbered),
+    "unnumbered_nonblank_line_count": sum(not value for value in numbered),
+    "markdown_bullet_line_count": sum(
+      re.match(r"\s*[-*+]\s+", line) is not None
+      for line in nonblank_lines),
+    "code_fence_present": any(
+      re.match(r"\s*(?:`{3,}|~{3,})", line) is not None
+      for line in nonblank_lines),
+    "header_like_first_line": (
+      first_nonblank is not None and not canonical[0]),
+    "trailing_noncanonical_line_count": trailing_noncanonical,
+    "canonical_line_match_count": sum(canonical),
+    "canonical_citation_match_count": sum(canonical_citations),
+    "citation_candidate_count": sum(citation_candidates),
+    "lines_missing_citation_count": sum(
+      is_numbered and not has_citation
+      for is_numbered, has_citation in zip(numbered, canonical_citations)),
+    "citation_line_count": len(citation_payloads),
+    "citation_payload_canonical_positive_integer_list_count": sum(
+      canonical_positive_integer_list(payload)
+      for payload in citation_payloads),
+    "citation_payload_with_alpha_count": sum(
+      any(character.isalpha() for character in payload)
+      for payload in citation_payloads),
+    "citation_payload_with_noncomma_punctuation_count": sum(
+      any(not (character.isalnum() or character.isspace()
+               or character == ",") for character in payload)
+      for payload in citation_payloads),
+    "citation_payload_with_semicolon_count": sum(
+      ";" in payload for payload in citation_payloads),
+    "citation_payload_with_colon_count": sum(
+      ":" in payload for payload in citation_payloads),
+    "citation_payload_with_hash_marker_count": sum(
+      "#" in payload for payload in citation_payloads),
+    "citation_payload_with_dash_count": sum(
+      any(character in "-\u2010\u2011\u2012\u2013\u2014\u2015"
+          for character in payload)
+      for payload in citation_payloads),
+    "citation_payload_with_slash_count": sum(
+      "/" in payload for payload in citation_payloads),
+    "citation_payload_with_square_bracket_count": sum(
+      "[" in payload or "]" in payload for payload in citation_payloads),
+    "citation_payload_digit_run_count_total": sum(
+      len(re.findall(r"\d+", payload)) for payload in citation_payloads),
+    "citation_payload_comma_count_total": sum(
+      payload.count(",") for payload in citation_payloads),
+    "citation_payload_leading_non_digit_count": sum(
+      bool(payload) and not payload[0].isdigit()
+      for payload in citation_payloads),
+    "citation_payload_trailing_non_digit_count": sum(
+      bool(payload) and not payload[-1].isdigit()
+      for payload in citation_payloads),
+    "citation_payload_only_digits_commas_whitespace_count": sum(
+      bool(payload) and all(
+        character.isdigit() or character.isspace() or character == ","
+        for character in payload)
+      for payload in citation_payloads),
+    "citation_line_with_trailing_nonwhitespace_after_parenthesis_count": (
+      sum(bool(suffix) for suffix in post_parenthesis_suffixes)),
+    "citation_line_with_post_parenthesis_suffix_count": sum(
+      bool(suffix) for suffix in post_parenthesis_suffixes),
+    "post_parenthesis_suffix_single_char_count": sum(
+      len(suffix) == 1 for suffix in post_parenthesis_suffixes),
+    "post_parenthesis_suffix_multi_char_count": sum(
+      len(suffix) > 1 for suffix in post_parenthesis_suffixes),
+    "post_parenthesis_suffix_period_count": sum(
+      "." in suffix for suffix in post_parenthesis_suffixes),
+    "post_parenthesis_suffix_comma_count": sum(
+      "," in suffix for suffix in post_parenthesis_suffixes),
+    "post_parenthesis_suffix_semicolon_count": sum(
+      ";" in suffix for suffix in post_parenthesis_suffixes),
+    "post_parenthesis_suffix_colon_count": sum(
+      ":" in suffix for suffix in post_parenthesis_suffixes),
+    "post_parenthesis_suffix_exclamation_count": sum(
+      "!" in suffix for suffix in post_parenthesis_suffixes),
+    "post_parenthesis_suffix_question_mark_count": sum(
+      "?" in suffix for suffix in post_parenthesis_suffixes),
+    "post_parenthesis_suffix_dash_count": sum(
+      any(character in "-\u2010\u2011\u2012\u2013\u2014\u2015"
+          for character in suffix)
+      for suffix in post_parenthesis_suffixes),
+    "post_parenthesis_suffix_alpha_count": sum(
+      any(character.isalpha() for character in suffix)
+      for suffix in post_parenthesis_suffixes),
+    "post_parenthesis_suffix_digit_count": sum(
+      any(character.isdigit() for character in suffix)
+      for suffix in post_parenthesis_suffixes),
+    "post_parenthesis_suffix_other_punctuation_count": sum(
+      any(not character.isalnum()
+          and character not in ".,;:!?-\u2010\u2011\u2012\u2013\u2014\u2015"
+          for character in suffix)
+      for suffix in post_parenthesis_suffixes),
+    "post_parenthesis_suffix_whitespace_only_count": sum(
+      not suffix for suffix in post_parenthesis_suffixes),
+    "parenthesis_pair_count": len(re.findall(
+      r"\([^()\r\n]*\)", effective_response)),
+    "because_of_literal_count": len(re.findall(
+      r"because of", effective_response)),
+    "json_like_wrapper_present": json_wrapper,
+    "yaml_like_wrapper_present": yaml_marker,
+  }
+
+
+def _parse_insight_and_guidance_response(gpt_response):
+  """Parse the exact historical insight/evidence text contract."""
+  if not isinstance(gpt_response, str):
+    raise InsightResponseContractError("STRUCTURE_INVALID")
+  gpt_response = gpt_response.strip()
+  if not gpt_response:
+    raise InsightResponseContractError("EMPTY_RESPONSE")
+  if not re.match(r"^\d+\.\s", gpt_response):
+    gpt_response = "1. " + gpt_response
+  ret = dict()
+  for line in gpt_response.split("\n"):
+    row = re.fullmatch(
+      r"\s*\d+\.\s*(.+?)\s*\(because of\s+([^)]+)\)\.?\s*", line)
+    if row is None:
+      raise InsightResponseContractError("PARSE_FAILURE", len(ret))
+    thought = row.group(1).strip()
+    evidence_text = row.group(2).strip()
+    if not thought:
+      raise InsightResponseContractError("BLANK_INSIGHT", len(ret))
+    if not re.fullmatch(
+        r"[+-]?\d+(?:\s*,\s*[+-]?\d+)*", evidence_text):
+      raise InsightResponseContractError("PARSE_FAILURE", len(ret))
+    evidence = [int(value.strip()) for value in evidence_text.split(",")]
+    if any(evidence_number < 1 for evidence_number in evidence):
+      raise InsightResponseContractError(
+        "EVIDENCE_NON_POSITIVE", len(ret))
+    if thought in ret:
+      raise InsightResponseContractError("STRUCTURE_INVALID", len(ret))
+    ret[thought] = evidence
+  if not ret:
+    raise InsightResponseContractError("EMPTY_MAPPING")
+  return ret
 
 def get_random_alphanumeric(i=6, j=6): 
   """
@@ -2220,36 +2449,70 @@ def run_gpt_prompt_focal_pt(persona, statements, n, test_input=None, verbose=Fal
 
   
 def run_gpt_prompt_insight_and_guidance(persona, statements, n, test_input=None, verbose=False): 
+  diagnostics = []
+  telemetry_cursor = len(get_telemetry())
+  _last_insight_validation_diagnostics.set(())
+
   def create_prompt_input(persona, statements, n, test_input=None): 
     prompt_input = [statements, str(n)]
     return prompt_input
   
   def __func_clean_up(gpt_response, prompt=""):
-    gpt_response = "1. " + gpt_response.strip()
-    ret = dict()
-    for i in gpt_response.split("\n"): 
-      row = i.split(". ")[-1]
-      thought = row.split("(because of ")[0].strip()
-      evi_raw = row.split("(because of ")[1].split(")")[0].strip()
-      evi_raw = re.findall(r'\d+', evi_raw)
-      evi_raw = [int(i.strip()) for i in evi_raw]
-      ret[thought] = evi_raw
-    return ret
+    return _parse_insight_and_guidance_response(gpt_response)
 
   def __func_validate(gpt_response, prompt=""): 
-    try: 
-      __func_clean_up(gpt_response, prompt)
-      return True
-    except:
-      return False 
+    nonlocal telemetry_cursor
+    attempt_events = get_telemetry()[telemetry_cursor:]
+    telemetry_cursor += len(attempt_events)
+    event = next((item for item in reversed(attempt_events)
+                  if item.caller_id == "insight_and_guidance"), None)
+    finish_reason = getattr(event, "finish_reason", None)
+    output_tokens = getattr(event, "output_tokens", None)
+    provider_outcome = getattr(event, "outcome", None)
+    provider_error_type = getattr(event, "error_type", None)
+    diagnostic = {
+      "attempt_number": len(diagnostics) + 1,
+      "requested_insight_count": n,
+      "provider_outcome": provider_outcome,
+      "provider_error_type": provider_error_type,
+      "finish_reason": finish_reason,
+      "output_token_count": output_tokens,
+      "response_present": (
+        isinstance(gpt_response, str) and bool(gpt_response.strip())),
+      "response_length_chars": (
+        len(gpt_response) if isinstance(gpt_response, str) else None),
+      "parser_status": "PARSE_FAILED",
+      "parsed_insight_count": 0,
+      "validation_status": "INVALID",
+      "failure_category": "UNKNOWN_VALIDATION_FAILURE",
+      "shape": _classify_insight_response_shape(gpt_response),
+    }
+    try:
+      parsed = __func_clean_up(gpt_response, prompt)
+      diagnostic.update(
+        parser_status="PARSED", parsed_insight_count=len(parsed),
+        validation_status="VALID", failure_category="VALID")
+      valid = True
+    except InsightResponseContractError as error:
+      diagnostic["parsed_insight_count"] = error.parsed_insight_count
+      diagnostic["failure_category"] = (
+        "PROVIDER_FAILURE" if provider_outcome == "ERROR"
+        else "TRUNCATED_OUTPUT" if finish_reason == "length"
+        else error.category)
+      valid = False
+    except Exception:
+      valid = False
+    diagnostics.append(diagnostic)
+    _last_insight_validation_diagnostics.set(tuple(diagnostics))
+    return valid
 
   def get_fail_safe(n): 
-    return ["I am hungry"] * n
+    return {}
 
 
 
 
-  gpt_param = {"engine": "text-davinci-003", "max_tokens": 150, 
+  gpt_param = {"engine": "text-davinci-003", "max_tokens": 300,
                "temperature": 0.5, "top_p": 1, "stream": False,
                "frequency_penalty": 0, "presence_penalty": 0, "stop": None}
   prompt_template = "persona/prompt_template/v2/insight_and_evidence_v1.txt"

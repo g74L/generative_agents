@@ -1,10 +1,12 @@
 import datetime
 from decimal import Decimal
+import json
 from pathlib import Path
 import socket
 import tempfile
 from types import SimpleNamespace
 import unittest
+import warnings
 from unittest.mock import patch
 
 
@@ -15,6 +17,13 @@ if str(BACKEND) not in sys.path:
 
 import controlled_replay
 import modern_smallville as subject
+from persona.cognitive_modules import reflect as reflect_module
+from persona.prompt_template import gpt_structure, run_gpt_prompt
+from persona.memory_structures.associative_memory import AssociativeMemory
+from persona.memory_structures.embedding_space import (
+  LEGACY_ADA_002_MANIFEST,
+  LegacyEmbeddingSpaceWarning,
+  write_embedding_manifest)
 
 
 class ModernTickFakeAdapter(controlled_replay.R1TDeterministicFakeAdapter):
@@ -242,6 +251,496 @@ class FailureCallerAttributionTests(unittest.TestCase):
       reloaded = subject._read_json(path)
       self.assertIsNone(reloaded["failure"]["caller"])
       self.assertIsNone(reloaded["failure"]["operation"])
+
+
+class ReflectionLifecycleObserverTests(unittest.TestCase):
+  """R1REF-A: the reflection lifecycle observer must be strictly read-only.
+
+  These tests drive the observer directly against small, deterministic
+  stand-ins for reflect.py's own functions (patched via unittest.mock, not
+  modified) so the observer's own recording/wiring logic is proven without
+  requiring a natural reflection trigger, an LLM provider, or a full
+  ReverieServer -- consistent with "observe, don't force": this class does
+  not simulate a natural reflection, it only proves the observer records
+  faithfully whatever reflect.py's real functions would have handed it,
+  and that reflect.py's own module namespace is untouched when disabled."""
+
+  @staticmethod
+  def _persona(name, importance_trigger_curr=150,
+               importance_trigger_max=150):
+    persona = SimpleNamespace(
+      name=name,
+      scratch=SimpleNamespace(
+        importance_trigger_curr=importance_trigger_curr,
+        importance_trigger_max=importance_trigger_max))
+    counter = {"count": 0}
+
+    def add_thought(created_ts, expiration, s, p, o, description, keywords,
+                    poignancy, embedding_pair, filling):
+      counter["count"] += 1
+      return SimpleNamespace(
+        node_id=f"node_{counter['count']}", type="thought",
+        description=description, poignancy=poignancy, filling=filling,
+        embedding_key=embedding_pair[0])
+
+    persona.a_mem = SimpleNamespace(add_thought=add_thought)
+    return persona
+
+  @staticmethod
+  def _server(*personas):
+    return SimpleNamespace(
+      personas={persona.name: persona for persona in personas})
+
+  def test_disabled_observer_installs_nothing(self):
+    persona = self._persona("Maria Lopez")
+    server = self._server(persona)
+    real_trigger = reflect_module.reflection_trigger
+    real_run_reflect = reflect_module.run_reflect
+    with subject._maybe_observe_reflection_lifecycle(
+        False, server, {"tick": 0}, "sim") as observer:
+      self.assertIsNone(observer)
+      self.assertIs(real_trigger, reflect_module.reflection_trigger)
+      self.assertIs(real_run_reflect, reflect_module.run_reflect)
+    self.assertIs(real_trigger, reflect_module.reflection_trigger)
+    self.assertIs(real_run_reflect, reflect_module.run_reflect)
+
+  def test_observer_sees_threshold_transition(self):
+    persona = self._persona(
+      "Maria Lopez", importance_trigger_curr=-1, importance_trigger_max=150)
+    server = self._server(persona)
+    with patch.object(
+        reflect_module, "reflection_trigger",
+        lambda p: p.scratch.importance_trigger_curr <= 0):
+      with subject._observe_reflection_lifecycle(
+          server, {"tick": 3}, "sim") as observer:
+        triggered = reflect_module.reflection_trigger(persona)
+    self.assertTrue(triggered)
+    self.assertEqual(1, len(observer.trigger_checks))
+    check = observer.trigger_checks[0]
+    self.assertEqual("Maria Lopez", check["actor"])
+    self.assertEqual(3, check["simulation_step"])
+    self.assertEqual(-1, check["importance_trigger_curr_before"])
+    self.assertEqual(150, check["importance_trigger_max"])
+    self.assertTrue(check["triggered"])
+
+  def test_observer_handles_no_reflection_naturally(self):
+    persona = self._persona(
+      "Maria Lopez", importance_trigger_curr=40, importance_trigger_max=150)
+    server = self._server(persona)
+    with patch.object(
+        reflect_module, "reflection_trigger",
+        lambda p: p.scratch.importance_trigger_curr <= 0):
+      with subject._observe_reflection_lifecycle(
+          server, {"tick": 1}, "sim") as observer:
+        triggered = reflect_module.reflection_trigger(persona)
+    self.assertFalse(triggered)
+    self.assertEqual([], observer.reflection_thoughts)
+    self.assertEqual([], observer.focal_points)
+    self.assertFalse(any(c["triggered"] for c in observer.trigger_checks))
+
+  def test_observer_records_focal_points_content_free(self):
+    persona = self._persona("Maria Lopez")
+    server = self._server(persona)
+    focal_points = ["Why did Klaus seem upset?", "What is the market like?"]
+    with patch.object(
+        reflect_module, "generate_focal_points",
+        lambda p, n=3: focal_points):
+      with subject._observe_reflection_lifecycle(
+          server, {"tick": 5}, "sim") as observer:
+        result = reflect_module.generate_focal_points(persona, 2)
+    self.assertEqual(focal_points, result)
+    self.assertEqual(1, len(observer.focal_points))
+    record = observer.focal_points[0]
+    self.assertEqual("Maria Lopez", record["actor"])
+    self.assertEqual(2, record["requested_count"])
+    self.assertEqual(
+      [subject._content_hash(item) for item in focal_points],
+      record["focal_point_hashes"])
+    self.assertNotIn("Klaus", str(record))
+
+  def test_observer_records_reflection_retrieval_refs(self):
+    persona = self._persona("Maria Lopez")
+    server = self._server(persona)
+    node_a = SimpleNamespace(node_id="node_3", type="event")
+    node_b = SimpleNamespace(node_id="node_7", type="thought")
+    fake_result = {"Why did Klaus seem upset?": [node_a, node_b]}
+    with patch.object(
+        reflect_module, "new_retrieve",
+        lambda p, focal_points, n_count=30: fake_result):
+      with subject._observe_reflection_lifecycle(
+          server, {"tick": 5}, "sim") as observer:
+        result = reflect_module.new_retrieve(
+          persona, ["Why did Klaus seem upset?"])
+    self.assertIs(fake_result, result)
+    self.assertEqual(1, len(observer.retrieval_events))
+    event = observer.retrieval_events[0]
+    self.assertEqual("Maria Lopez", event["actor"])
+    self.assertEqual("reflection_new_retrieve", event["retrieval_context"])
+    self.assertEqual(["node_3", "node_7"], event["retrieved_node_ids"])
+    self.assertEqual(
+      ["Maria Lopez::node_3", "Maria Lopez::node_7"],
+      event["retrieved_node_refs"])
+    self.assertEqual(["event", "thought"], event["retrieved_node_types"])
+
+  def test_observer_records_insights_and_new_thought_lineage_refs(self):
+    persona = self._persona("Klaus Mueller")
+    server = self._server(persona)
+
+    def fake_focal_points(p, n=3):
+      return ["What did I learn about the market?"]
+
+    def fake_retrieve(p, focal_points, n_count=30):
+      node = SimpleNamespace(node_id="node_2", type="event")
+      return {focal_points[0]: [node]}
+
+    def fake_insights(p, nodes, n=5):
+      # generate_insights_and_evidence's real contract already translates
+      # evidence indices to node_id strings before returning (reflect.py
+      # lines 51-53) -- this stand-in returns the same post-translation
+      # shape run_reflect actually receives.
+      return {"The market is competitive": [nodes[0].node_id]}
+
+    def fake_run_reflect(p):
+      # Stand-in for reflect.run_reflect's own call graph, used only to
+      # exercise the observer's wrapping deterministically. reflect.py
+      # itself is unmodified and untouched by this wave.
+      focal_points = reflect_module.generate_focal_points(p, 3)
+      retrieved = reflect_module.new_retrieve(p, focal_points)
+      for focal_pt, nodes in retrieved.items():
+        thoughts = reflect_module.generate_insights_and_evidence(p, nodes, 5)
+        for thought, evidence in thoughts.items():
+          p.a_mem.add_thought(
+            "2026-01-01 08:00:00", None, p.name, "reflected on", thought,
+            thought, {"market"}, 6, (thought, [0.1, 0.2]), evidence)
+
+    with patch.object(
+          reflect_module, "generate_focal_points", fake_focal_points), \
+        patch.object(reflect_module, "new_retrieve", fake_retrieve), \
+        patch.object(
+          reflect_module, "generate_insights_and_evidence", fake_insights), \
+        patch.object(reflect_module, "run_reflect", fake_run_reflect):
+      with subject._observe_reflection_lifecycle(
+          server, {"tick": 8}, "sim") as observer:
+        reflect_module.run_reflect(persona)
+
+    self.assertEqual(1, len(observer.insights))
+    insight_record = observer.insights[0]
+    self.assertEqual(["Klaus Mueller::node_2"],
+                     insight_record["evidence_node_refs"])
+    self.assertEqual(1, len(observer.reflection_thoughts))
+    thought_record = observer.reflection_thoughts[0]
+    self.assertEqual("Klaus Mueller", thought_record["actor"])
+    self.assertEqual("node_1", thought_record["node_id"])
+    self.assertEqual("Klaus Mueller::node_1", thought_record["node_ref"])
+    self.assertEqual(["node_2"], thought_record["evidence_node_ids"])
+    self.assertEqual(["Klaus Mueller::node_2"],
+                     thought_record["evidence_node_refs"])
+    self.assertEqual([], observer.conversation_followup_thoughts)
+
+  def test_observer_distinguishes_conversation_followup_thoughts(self):
+    persona = self._persona("Maria Lopez")
+    server = self._server(persona)
+    with subject._observe_reflection_lifecycle(
+        server, {"tick": 8}, "sim") as observer:
+      # Not inside run_reflect -- mirrors reflect()'s chatting_end_time
+      # planning/memo thought branch, which is not the scientific
+      # "reflection" this wave measures.
+      persona.a_mem.add_thought(
+        "2026-01-01 08:00:00", None, persona.name, "planned", "to relax",
+        "planned to relax", {"relax"}, 4, ("planned to relax", [0.0]), [])
+    self.assertEqual([], observer.reflection_thoughts)
+    self.assertEqual(1, len(observer.conversation_followup_thoughts))
+
+  def test_actor_qualified_refs_are_unambiguous_across_actors(self):
+    maria = self._persona("Maria Lopez")
+    klaus = self._persona("Klaus Mueller")
+    server = self._server(maria, klaus)
+    with subject._observe_reflection_lifecycle(
+        server, {"tick": 1}, "sim") as observer:
+      maria.a_mem.add_thought(
+        "2026-01-01 08:00:00", None, maria.name, "reflected on", "x",
+        "x", {"x"}, 5, ("x", [0.0]), [])
+      klaus.a_mem.add_thought(
+        "2026-01-01 08:00:00", None, klaus.name, "reflected on", "x",
+        "x", {"x"}, 5, ("x", [0.0]), [])
+    refs = {record["node_ref"]
+            for record in observer.conversation_followup_thoughts}
+    self.assertEqual({"Maria Lopez::node_1", "Klaus Mueller::node_1"}, refs)
+    self.assertEqual(2, len(refs))
+
+  def test_observer_records_are_json_serializable(self):
+    persona = self._persona("Maria Lopez")
+    server = self._server(persona)
+    with patch.object(
+        reflect_module, "reflection_trigger",
+        lambda p: p.scratch.importance_trigger_curr <= 0), \
+        patch.object(
+          reflect_module, "generate_focal_points", lambda p, n=3: ["q"]):
+      with subject._observe_reflection_lifecycle(
+          server, {"tick": 2}, "sim") as observer:
+        reflect_module.reflection_trigger(persona)
+        reflect_module.generate_focal_points(persona, 1)
+        persona.a_mem.add_thought(
+          "2026-01-01 08:00:00", None, persona.name, "reflected on", "x",
+          "x", {"x"}, 5, ("x", [0.0]), ["node_1"])
+    payload = {
+      "trigger_checks": observer.trigger_checks,
+      "focal_points": observer.focal_points,
+      "conversation_followup_thoughts": observer.conversation_followup_thoughts,
+    }
+    encoded = json.dumps(payload)
+    self.assertIn("Maria Lopez", encoded)
+
+  def test_observer_records_privacy_safe_insight_attempt_diagnostics(self):
+    persona = self._persona("Klaus Mueller")
+    server = self._server(persona)
+    sentinel = "PRIVATE-INVALID-RESPONSE"
+    with patch.object(run_gpt_prompt, "debug", False), patch.object(
+        run_gpt_prompt, "generate_prompt", return_value="PRIVATE-PROMPT"), (
+        patch.object(gpt_structure, "GPT_request", return_value=sentinel)):
+      with subject._observe_reflection_lifecycle(
+          server, {"tick": 12}, "sim") as observer:
+        output = reflect_module.run_gpt_prompt_insight_and_guidance(
+          persona, "1. private", 5)[0]
+    self.assertEqual({}, output)
+    self.assertEqual(5, len(observer.insight_attempt_diagnostics))
+    encoded = json.dumps(observer.insight_attempt_diagnostics)
+    self.assertNotIn(sentinel, encoded)
+    self.assertNotIn("PRIVATE-PROMPT", encoded)
+    self.assertTrue(all(
+      item["actor"] == "Klaus Mueller"
+      and item["simulation_step"] == 12
+      and item["failure_category"] == "PARSE_FAILURE"
+      and item["shape"]["response_line_count"] == 1
+      and item["shape"]["canonical_line_match_count"] == 0
+      and item["shape"]["citation_line_count"] == 0
+      and item["shape"][
+        "citation_line_with_post_parenthesis_suffix_count"] == 0
+      for item in observer.insight_attempt_diagnostics))
+
+  def test_observer_records_mapping_failure_category_without_masking_error(self):
+    persona = self._persona("Klaus Mueller")
+    server = self._server(persona)
+
+    def fail_mapping(*args, **kwargs):
+      raise reflect_module.ReflectionInsightContractError(
+        "no mapping", category="EMPTY_MAPPING")
+
+    with patch.object(
+        reflect_module, "generate_insights_and_evidence", fail_mapping):
+      with subject._observe_reflection_lifecycle(
+          server, {"tick": 13}, "sim") as observer:
+        with self.assertRaises(reflect_module.ReflectionInsightContractError):
+          reflect_module.generate_insights_and_evidence(persona, [], 5)
+    self.assertEqual([{
+      "actor": "Klaus Mueller", "simulation_step": 13,
+      "failure_category": "EMPTY_MAPPING",
+    }], observer.insight_contract_failures)
+
+
+class ReflectionThoughtPersistenceRoundTripTests(unittest.TestCase):
+  """R1REF-A section 9/10: prove a reflection Thought's save -> reload
+  round trip via the real AssociativeMemory store (not a fake), and that
+  _reflection_round_trip_checks correctly classifies persistence
+  eligibility independent of any full simulation run."""
+
+  def setUp(self):
+    self.temporary = tempfile.TemporaryDirectory()
+    self.root = Path(self.temporary.name)
+
+  def tearDown(self):
+    self.temporary.cleanup()
+
+  @staticmethod
+  def _bootstrap_memory(path):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "nodes.json").write_text("{}", encoding="utf-8")
+    (path / "embeddings.json").write_text("{}", encoding="utf-8")
+    (path / "kw_strength.json").write_text(
+      json.dumps({"kw_strength_event": {}, "kw_strength_thought": {}}),
+      encoding="utf-8")
+    write_embedding_manifest(path, LEGACY_ADA_002_MANIFEST)
+    with warnings.catch_warnings():
+      warnings.simplefilter("ignore", LegacyEmbeddingSpaceWarning)
+      return AssociativeMemory(str(path))
+
+  @staticmethod
+  def _vector(first=0.1, second=0.2):
+    return [first, second] + [0.0] * (
+      LEGACY_ADA_002_MANIFEST.dimensions - 2)
+
+  def test_reflection_thought_round_trips_through_save_and_reload(self):
+    actor = "Maria Lopez"
+    source = self._bootstrap_memory(self.root / "source")
+    created = datetime.datetime(2026, 1, 1, 8, 0, 0)
+    evidence_node = source.add_event(
+      created, None, actor, "observed", "the market",
+      "Maria observed the market", {"market"}, 6,
+      ("Maria observed the market", self._vector(0.1, 0.2)), [])
+    thought = source.add_thought(
+      created, created + datetime.timedelta(days=30), actor, "reflected on",
+      "market trends", "Maria reflected on market trends", {"market"}, 7,
+      ("Maria reflected on market trends", self._vector(0.3, 0.4)),
+      [evidence_node.node_id])
+    record = {
+      "actor": actor, "node_id": thought.node_id,
+      "node_ref": f"{actor}::{thought.node_id}",
+      "poignancy": 7,
+      "description_hash": subject._content_hash(
+        "Maria reflected on market trends"),
+      "evidence_node_ids": [evidence_node.node_id],
+    }
+
+    saved_personas_root = self.root / "saved"
+    memory_dir = (saved_personas_root / "personas" / actor
+                  / "bootstrap_memory" / "associative_memory")
+    memory_dir.mkdir(parents=True)
+    source.save(str(memory_dir))
+
+    with warnings.catch_warnings():
+      warnings.simplefilter("ignore", LegacyEmbeddingSpaceWarning)
+      reloaded_memory = AssociativeMemory(str(memory_dir))
+    reloaded_persona = SimpleNamespace(a_mem=reloaded_memory)
+
+    checks = subject._reflection_round_trip_checks(
+      [record], saved_personas_root, {actor: reloaded_persona})
+    self.assertEqual(1, len(checks))
+    check = checks[0]
+    self.assertTrue(check["persisted"], check)
+    self.assertTrue(check["reloaded"], check)
+    self.assertTrue(check["poignancy_preserved"], check)
+    self.assertTrue(check["description_hash_preserved"], check)
+    self.assertTrue(check["evidence_preserved"], check)
+    self.assertTrue(check["in_seq_thought_after_reload"], check)
+    self.assertTrue(check["embedding_available_after_reload"], check)
+
+  def test_missing_node_reports_not_persisted_honestly(self):
+    checks = subject._reflection_round_trip_checks(
+      [{"actor": "Maria Lopez", "node_id": "node_99",
+        "node_ref": "Maria Lopez::node_99", "poignancy": 5,
+        "description_hash": "irrelevant", "evidence_node_ids": []}],
+      self.root / "nowhere", {})
+    self.assertEqual(1, len(checks))
+    self.assertFalse(checks[0]["persisted"])
+    self.assertFalse(checks[0]["reloaded"])
+
+
+class ReflectionLifecycleVerdictTests(unittest.TestCase):
+  @staticmethod
+  def _section(**overrides):
+    section = {
+      "observation_enabled": True,
+      "natural_trigger_observed": False,
+      "reflection_thoughts_created": [],
+      "lineage_verified": False,
+      "reflection_persisted": False,
+      "reflection_reloaded": False,
+      "reflection_retrieval_eligible_after_reload": False,
+    }
+    section.update(overrides)
+    return section
+
+  def test_disabled_observation_yields_no_verdict(self):
+    section = self._section(observation_enabled=False)
+    self.assertIsNone(subject._reflection_lifecycle_verdict(
+      section, run_error=None, run_success=True))
+
+  def test_run_error_yields_blocked(self):
+    section = self._section()
+    self.assertEqual(
+      subject.R1REF_A_BLOCKED_VERDICT,
+      subject._reflection_lifecycle_verdict(
+        section, run_error=RuntimeError("x"), run_success=False))
+
+  def test_no_natural_trigger_yields_path_not_reached(self):
+    section = self._section()
+    self.assertEqual(
+      subject.R1REF_A_PATH_NOT_REACHED_VERDICT,
+      subject._reflection_lifecycle_verdict(
+        section, run_error=None, run_success=True))
+
+  def test_full_chain_yields_passed(self):
+    section = self._section(
+      natural_trigger_observed=True,
+      reflection_thoughts_created=[{"node_id": "node_1"}],
+      lineage_verified=True, reflection_persisted=True,
+      reflection_reloaded=True,
+      reflection_retrieval_eligible_after_reload=True)
+    self.assertEqual(
+      subject.R1REF_A_PASSED_VERDICT,
+      subject._reflection_lifecycle_verdict(
+        section, run_error=None, run_success=True))
+
+  def test_trigger_fired_but_chain_incomplete_yields_blocked(self):
+    section = self._section(
+      natural_trigger_observed=True,
+      reflection_thoughts_created=[{"node_id": "node_1"}],
+      lineage_verified=True, reflection_persisted=True,
+      reflection_reloaded=False,
+      reflection_retrieval_eligible_after_reload=False)
+    self.assertEqual(
+      subject.R1REF_A_BLOCKED_VERDICT,
+      subject._reflection_lifecycle_verdict(
+        section, run_error=None, run_success=True))
+
+
+class ReflectionLifecycleIntegrationTests(unittest.TestCase):
+  """Full offline (FakeModernChatAdapter, zero live provider calls) proof
+  that the --observe-reflection-lifecycle wiring integrates cleanly into
+  run_modern_smallville without ever naturally reaching the reflection
+  threshold in one tick -- an honest PATH_NOT_REACHED, not a forced PASS."""
+
+  def setUp(self):
+    self.temporary = tempfile.TemporaryDirectory()
+    self.runtime_root = Path(self.temporary.name) / "live-runs"
+
+  def tearDown(self):
+    self.temporary.cleanup()
+
+  def test_disabled_by_default_and_absent_from_behavior(self):
+    adapter = ModernTickFakeAdapter()
+    config = subject.ModernRunConfig(
+      run_name="reflection-observer-off", ticks=1,
+      cost_ceiling_usd=Decimal("0.03"))
+    self.assertFalse(config.observe_reflection_lifecycle)
+    result = subject.run_modern_smallville(
+      config, adapter=adapter, runtime_root=self.runtime_root)
+    self.assertEqual("MODERN_SMALLVILLE_HEADLESS_RUN_PASSED", result.verdict)
+    report = subject._read_json(result.run_directory / "report.json")
+    section = report["reflection_lifecycle"]
+    self.assertFalse(section["observation_enabled"])
+    self.assertEqual([], section["trigger_checks"])
+    self.assertEqual([], section["reflection_thoughts_created"])
+    self.assertIsNone(section["verdict"])
+
+  def test_enabled_flag_survives_one_tick_with_path_not_reached(self):
+    adapter = ModernTickFakeAdapter()
+    config = subject.ModernRunConfig(
+      run_name="reflection-observer-on", ticks=1,
+      cost_ceiling_usd=Decimal("0.03"),
+      observe_reflection_lifecycle=True)
+    result = subject.run_modern_smallville(
+      config, adapter=adapter, runtime_root=self.runtime_root)
+    self.assertEqual("MODERN_SMALLVILLE_HEADLESS_RUN_PASSED", result.verdict)
+    report = subject._read_json(result.run_directory / "report.json")
+    section = report["reflection_lifecycle"]
+    self.assertTrue(section["observation_enabled"])
+    self.assertFalse(section["natural_trigger_observed"])
+    self.assertEqual([], section["reflection_thoughts_created"])
+    self.assertEqual([], section["insight_attempt_diagnostics"])
+    self.assertEqual([], section["insight_contract_failures"])
+    self.assertEqual(
+      subject.R1REF_A_PATH_NOT_REACHED_VERDICT, section["verdict"])
+    self.assertIn(
+      "Isabella Rodriguez", section["importance_trigger_max_by_actor"])
+
+  def test_cli_wires_flag_for_run_and_resume(self):
+    parser = subject.build_parser()
+    run_args = parser.parse_args(["run", "--observe-reflection-lifecycle"])
+    self.assertTrue(run_args.observe_reflection_lifecycle)
+    resume_args = parser.parse_args(
+      ["resume", "--from", "x", "--observe-reflection-lifecycle"])
+    self.assertTrue(resume_args.observe_reflection_lifecycle)
 
 
 class CausalSocialMemoryTests(unittest.TestCase):

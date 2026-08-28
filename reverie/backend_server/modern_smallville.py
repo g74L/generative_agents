@@ -108,6 +108,17 @@ R1CLI_A2_B_READY_VERDICT = (
 R1CLI_A2_B_BLOCKED_VERDICT = "R1CLI_A2_B_CAUSAL_SOCIAL_MEMORY_BLOCKED"
 R1CLI_A2_B_PATH_NOT_REACHED_VERDICT = (
   "R1CLI_A2_B_CAUSAL_SOCIAL_PATH_NOT_REACHED")
+R1REF_A_PASSED_VERDICT = "R1REF_NATURAL_REFLECTION_LIFECYCLE_PASSED"
+R1REF_A_PATH_NOT_REACHED_VERDICT = (
+  "R1REF_NATURAL_REFLECTION_PATH_NOT_REACHED")
+R1REF_A_BLOCKED_VERDICT = "R1REF_NATURAL_REFLECTION_BLOCKED"
+# Caller IDs that can be attributed to the reflection wrapper chain (focal
+# point generation, insight/evidence generation) with no ambiguity. Other
+# reflection-adjacent callers -- event_poignancy (perceive.py + reflect.py
+# share this wrapper) and event_triple (reflect.py + plan.py + converse.py
+# share this wrapper) -- cannot be exclusively attributed to reflection by
+# caller_id alone and are deliberately excluded from this set.
+R1REF_EXCLUSIVE_REFLECTION_CALLERS = ("focal_pt", "insight_and_guidance")
 
 RESUME_SCRATCH_FIELDS = (
   "curr_time", "curr_tile", "daily_plan_req", "daily_req",
@@ -173,6 +184,7 @@ class ModernRunConfig:
   visible_actors: tuple[str, ...] = VISIBLE_ACTORS
   cost_ceiling_usd: Decimal = DEFAULT_COST_CEILING
   controlled_proximity: bool = False
+  observe_reflection_lifecycle: bool = False
 
   def __post_init__(self):
     if type(self.ticks) is not int or self.ticks <= 0:
@@ -237,6 +249,9 @@ class ModernRunConfig:
       if self.ticks > 10:
         raise ModernRunConfigurationError(
           "R1M3-C permits at most ten ticks")
+    if type(self.observe_reflection_lifecycle) is not bool:
+      raise ModernRunConfigurationError(
+        "observe_reflection_lifecycle must be a boolean")
 
 
 @dataclass(frozen=True)
@@ -246,6 +261,7 @@ class ModernResumeConfig:
   ticks: int = 5
   cost_ceiling_usd: Decimal = DEFAULT_COST_CEILING
   observe_causal_social_memory: bool = False
+  observe_reflection_lifecycle: bool = False
 
   def __post_init__(self):
     if not isinstance(self.source_run, Path):
@@ -265,6 +281,9 @@ class ModernResumeConfig:
     if type(self.observe_causal_social_memory) is not bool:
       raise ModernRunConfigurationError(
         "observe_causal_social_memory must be a boolean")
+    if type(self.observe_reflection_lifecycle) is not bool:
+      raise ModernRunConfigurationError(
+        "observe_reflection_lifecycle must be a boolean")
 
 
 @dataclass(frozen=True)
@@ -694,6 +713,85 @@ def _loaded_social_memory_snapshot(personas):
   return _social_memory_snapshot({
     name: personas[name].a_mem.id_to_node
     for name in R1M3C_ACTORS if name in personas})
+
+
+def _persisted_reflection_node(saved_root, actor, node_id):
+  """Read one Thought node straight from the on-disk associative memory,
+  independent of any in-process object -- proves ``server.save()`` itself
+  wrote the reflection Thought, not merely that it existed in memory."""
+  nodes_path = (saved_root / "personas" / actor / "bootstrap_memory"
+                / "associative_memory" / "nodes.json")
+  if not nodes_path.is_file():
+    return None
+  nodes = _read_json(nodes_path)
+  if not isinstance(nodes, dict):
+    return None
+  return nodes.get(node_id)
+
+
+def _reflection_round_trip_checks(reflection_thoughts, saved_root,
+                                   reloaded_personas):
+  """For each reflection Thought the observer saw created, verify it
+  survives (a) the on-disk save and (b) a fresh ``ReverieServer`` reload,
+  preserving type/poignancy/description/evidence and remaining structurally
+  present in ``seq_thought`` with its embedding available. This proves
+  retrieval *eligibility*, not ranking fidelity -- ``last_accessed`` is not
+  persisted by ``AssociativeMemory.save`` and always resets to ``created``
+  on reload, so recency ranking after reload is a distinct, unverified
+  property left to R1FID."""
+  checks = []
+  for record in reflection_thoughts:
+    actor, node_id = record["actor"], record["node_id"]
+    disk_node = _persisted_reflection_node(saved_root, actor, node_id)
+    persisted = (
+      disk_node is not None and _node_field(disk_node, "type") == "thought")
+    reloaded_persona = reloaded_personas.get(actor)
+    reloaded_mem = reloaded_persona.a_mem if reloaded_persona else None
+    reloaded_node = (
+      reloaded_mem.id_to_node.get(node_id) if reloaded_mem else None)
+    reloaded = reloaded_node is not None and reloaded_node.type == "thought"
+    checks.append({
+      "actor": actor, "node_id": node_id, "node_ref": record["node_ref"],
+      "persisted": persisted,
+      "reloaded": reloaded,
+      "poignancy_preserved": (
+        persisted
+        and _node_field(disk_node, "poignancy") == record["poignancy"]),
+      "description_hash_preserved": (
+        persisted and _content_hash(_node_field(disk_node, "description"))
+        == record["description_hash"]),
+      "evidence_preserved": (
+        persisted and sorted(_node_field(disk_node, "filling") or [])
+        == sorted(record["evidence_node_ids"])),
+      "in_seq_thought_after_reload": (
+        reloaded and reloaded_node in reloaded_mem.seq_thought),
+      "embedding_available_after_reload": (
+        reloaded and reloaded_node.embedding_key in reloaded_mem.embeddings),
+    })
+  return checks
+
+
+def _reflection_lifecycle_verdict(section, *, run_error, run_success):
+  """Pure classifier over an assembled reflection_lifecycle report section.
+
+  Honest by construction: PASS requires every link in the chain (natural
+  trigger -> Thought created -> lineage verified -> persisted -> reloaded ->
+  retrieval-eligible) to hold; PATH_NOT_REACHED is not a failure, it means
+  the window observed simply never crossed the reflection threshold;
+  BLOCKED covers both a broken run and a trigger that fired without the
+  chain completing structurally (a compatibility defect worth stopping on).
+  """
+  if not section["observation_enabled"]:
+    return None
+  if run_error is not None or not run_success:
+    return R1REF_A_BLOCKED_VERDICT
+  if not section["natural_trigger_observed"]:
+    return R1REF_A_PATH_NOT_REACHED_VERDICT
+  if (section["reflection_thoughts_created"] and section["lineage_verified"]
+      and section["reflection_persisted"] and section["reflection_reloaded"]
+      and section["reflection_retrieval_eligible_after_reload"]):
+    return R1REF_A_PASSED_VERDICT
+  return R1REF_A_BLOCKED_VERDICT
 
 
 def _resume_actor_hydration_checks(persisted, loaded, copied_hash):
@@ -1414,6 +1512,216 @@ def _observe_conversations(
     observer.restore()
 
 
+class _ReflectionLifecycleObserver:
+  """Read-only observation of the existing, unmodified natural Stanford
+  reflection path (reflect.py): trigger check, focal-point generation,
+  reflection retrieval, insight/evidence generation, and Thought creation.
+
+  Every wrapped function below delegates to the unmodified original and
+  returns its result completely unchanged -- this observer never alters
+  the reflection trigger, the importance accumulator, retrieval ranking,
+  or memory content. It only records content-free (hashed) metadata about
+  calls that already happened."""
+
+  def __init__(self, server, execution_state, simulation_id):
+    self.server = server
+    self.execution_state = execution_state
+    self.simulation_id = simulation_id
+    self.importance_trigger_max_by_actor = {
+      name: persona.scratch.importance_trigger_max
+      for name, persona in server.personas.items()}
+    self.trigger_checks = []
+    self.focal_points = []
+    self.retrieval_events = []
+    self.insights = []
+    self.insight_attempt_diagnostics = []
+    self.insight_contract_failures = []
+    self.reflection_thoughts = []
+    self.conversation_followup_thoughts = []
+    self._within_run_reflect = {}
+    self._originals = {}
+    self._original_add_thought = {}
+
+  def install(self):
+    reflect_module = importlib.import_module(
+      "persona.cognitive_modules.reflect")
+    self._originals = {
+      "reflection_trigger": reflect_module.reflection_trigger,
+      "run_reflect": reflect_module.run_reflect,
+      "generate_focal_points": reflect_module.generate_focal_points,
+      "new_retrieve": reflect_module.new_retrieve,
+      "generate_insights_and_evidence":
+        reflect_module.generate_insights_and_evidence,
+      "run_gpt_prompt_insight_and_guidance":
+        reflect_module.run_gpt_prompt_insight_and_guidance,
+    }
+
+    def observed_trigger(persona):
+      before = persona.scratch.importance_trigger_curr
+      threshold = persona.scratch.importance_trigger_max
+      triggered = self._originals["reflection_trigger"](persona)
+      self.trigger_checks.append({
+        "actor": persona.name,
+        "simulation_step": self.execution_state["tick"],
+        "importance_trigger_curr_before": before,
+        "importance_trigger_max": threshold,
+        "triggered": bool(triggered),
+      })
+      return triggered
+
+    def observed_run_reflect(persona):
+      self._within_run_reflect[persona.name] = True
+      try:
+        return self._originals["run_reflect"](persona)
+      finally:
+        self._within_run_reflect[persona.name] = False
+
+    def observed_focal_points(persona, n=3):
+      result = self._originals["generate_focal_points"](persona, n)
+      self.focal_points.append({
+        "actor": persona.name,
+        "simulation_step": self.execution_state["tick"],
+        "requested_count": n,
+        "focal_point_hashes": [_content_hash(item) for item in result],
+      })
+      return result
+
+    def observed_retrieve(persona, focal_points, n_count=30):
+      result = self._originals["new_retrieve"](
+        persona, focal_points, n_count)
+      nodes = {
+        node.node_id: node for values in result.values() for node in values}
+      node_ids = _canonical_node_ids(nodes)
+      self.retrieval_events.append({
+        "actor": persona.name,
+        "simulation_step": self.execution_state["tick"],
+        "retrieval_context": "reflection_new_retrieve",
+        "focal_point_hashes": [
+          _content_hash(item) for item in focal_points],
+        "retrieved_node_ids": node_ids,
+        "retrieved_node_refs": [
+          f"{persona.name}::{node_id}" for node_id in node_ids],
+        "retrieved_node_types": [nodes[node_id].type for node_id in node_ids],
+      })
+      return result
+
+    def observed_insights(persona, nodes, n=5):
+      try:
+        result = self._originals["generate_insights_and_evidence"](
+          persona, nodes, n)
+      except reflect_module.ReflectionInsightContractError as error:
+        self.insight_contract_failures.append({
+          "actor": persona.name,
+          "simulation_step": self.execution_state["tick"],
+          "failure_category": error.category,
+        })
+        raise
+      self.insights.append({
+        "actor": persona.name,
+        "simulation_step": self.execution_state["tick"],
+        "insight_count": len(result),
+        "insight_hashes": [_content_hash(thought) for thought in result],
+        "evidence_node_refs": sorted({
+          f"{persona.name}::{node_id}"
+          for node_ids in result.values() for node_id in node_ids}),
+      })
+      return result
+
+    def observed_insight_prompt(persona, statements, n, *args, **kwargs):
+      try:
+        return self._originals["run_gpt_prompt_insight_and_guidance"](
+          persona, statements, n, *args, **kwargs)
+      finally:
+        for diagnostic in (
+            run_gpt_prompt.get_last_insight_validation_diagnostics()):
+          self.insight_attempt_diagnostics.append({
+            "actor": persona.name,
+            "simulation_step": self.execution_state["tick"],
+            **diagnostic,
+          })
+
+    reflect_module.reflection_trigger = observed_trigger
+    reflect_module.run_reflect = observed_run_reflect
+    reflect_module.generate_focal_points = observed_focal_points
+    reflect_module.new_retrieve = observed_retrieve
+    reflect_module.generate_insights_and_evidence = observed_insights
+    reflect_module.run_gpt_prompt_insight_and_guidance = (
+      observed_insight_prompt)
+
+    for name, persona in self.server.personas.items():
+      original_add_thought = persona.a_mem.add_thought
+      self._original_add_thought[name] = original_add_thought
+
+      def observed_add_thought(created, expiration, s, p, o, description,
+                               keywords, poignancy, embedding_pair, filling,
+                               _name=name, _original=original_add_thought):
+        node = _original(created, expiration, s, p, o, description,
+                         keywords, poignancy, embedding_pair, filling)
+        evidence_ids = [
+          item for item in (filling or [])
+          if isinstance(item, str) and item.startswith("node_")]
+        record = {
+          "actor": _name,
+          "simulation_step": self.execution_state["tick"],
+          "node_id": node.node_id,
+          "node_ref": f"{_name}::{node.node_id}",
+          "poignancy": poignancy,
+          "description_hash": _content_hash(description),
+          "evidence_node_ids": evidence_ids,
+          "evidence_node_refs": [
+            f"{_name}::{node_id}" for node_id in evidence_ids],
+        }
+        if self._within_run_reflect.get(_name):
+          self.reflection_thoughts.append(record)
+        else:
+          self.conversation_followup_thoughts.append(record)
+        return node
+
+      persona.a_mem.add_thought = observed_add_thought
+    return self
+
+  def restore(self):
+    reflect_module = importlib.import_module(
+      "persona.cognitive_modules.reflect")
+    if self._originals:
+      reflect_module.reflection_trigger = self._originals[
+        "reflection_trigger"]
+      reflect_module.run_reflect = self._originals["run_reflect"]
+      reflect_module.generate_focal_points = self._originals[
+        "generate_focal_points"]
+      reflect_module.new_retrieve = self._originals["new_retrieve"]
+      reflect_module.generate_insights_and_evidence = self._originals[
+        "generate_insights_and_evidence"]
+      reflect_module.run_gpt_prompt_insight_and_guidance = self._originals[
+        "run_gpt_prompt_insight_and_guidance"]
+    for name, original in self._original_add_thought.items():
+      self.server.personas[name].a_mem.add_thought = original
+
+
+@contextmanager
+def _observe_reflection_lifecycle(server, execution_state, simulation_id):
+  observer = _ReflectionLifecycleObserver(
+    server, execution_state, simulation_id).install()
+  try:
+    yield observer
+  finally:
+    observer.restore()
+
+
+@contextmanager
+def _maybe_observe_reflection_lifecycle(
+    enabled, server, execution_state, simulation_id):
+  """Opt-in wrapper: when ``enabled`` is False, no function is patched at
+  all -- a structural (not merely behavioral) guarantee that a disabled
+  observer changes nothing about the run."""
+  if not enabled:
+    yield None
+    return
+  with _observe_reflection_lifecycle(
+      server, execution_state, simulation_id) as observer:
+    yield observer
+
+
 def _indexed_history_hashes(root: Path, first: int, stop: int):
   expected = tuple(f"{index}.json" for index in range(first, stop))
   actual = tuple(sorted(
@@ -1696,6 +2004,8 @@ def _execute_modern_smallville(
   causal_run_snapshot = {}
   controlled_fixture = {}
   interaction_observer = None
+  reflection_observer = None
+  reflection_round_trip = []
   execution_state = {"stage": "initialization", "actor": None,
                      "tick": source_step}
 
@@ -1808,6 +2118,9 @@ def _execute_modern_smallville(
               return _original(*args, **kwargs)
 
           persona.move = counted_move
+        reflection_lifecycle_enabled = (
+          resume.request.observe_reflection_lifecycle if resume is not None
+          else config.observe_reflection_lifecycle)
         with (install_passive_visible_moves(
                 server, config.passive_actors) as passive_controller,
               _observe_conversations(
@@ -1819,7 +2132,11 @@ def _execute_modern_smallville(
                 (causal_pre_resume.get("chat_node_refs", ())
                  if resume is not None
                  and resume.request.observe_causal_social_memory else ()),
-              ) as interaction_observer):
+              ) as interaction_observer,
+              _maybe_observe_reflection_lifecycle(
+                reflection_lifecycle_enabled, server, execution_state,
+                simulation_code,
+              ) as reflection_observer):
           previous_tick_state = actor_state_before
           for tick in range(config.ticks):
             step_before, time_before = server.step, server.curr_time
@@ -2094,6 +2411,10 @@ def _execute_modern_smallville(
           "actors": actor_state_reload,
           "provider_calls": calls_after_reload - calls_before_reload,
         }
+        if reflection_observer is not None and reflection_observer.reflection_thoughts:
+          reflection_round_trip = _reflection_round_trip_checks(
+            reflection_observer.reflection_thoughts, saved_root,
+            reloaded.personas)
         if not reload_passed:
           raise ModernRuntimeInvariantError("offline reload verification failed")
         final_step, final_time = server.step, server.curr_time
@@ -2241,6 +2562,84 @@ def _execute_modern_smallville(
     interaction_observer.last_chat_events if interaction_observer else [])
   causal_observation_enabled = bool(
     resume is not None and resume.request.observe_causal_social_memory)
+  reflection_observation_enabled = bool(
+    resume.request.observe_reflection_lifecycle if resume is not None
+    else config.observe_reflection_lifecycle)
+  reflection_thoughts_created = (
+    reflection_observer.reflection_thoughts if reflection_observer else [])
+  conversation_followup_thoughts_created = (
+    reflection_observer.conversation_followup_thoughts
+    if reflection_observer else [])
+  reflection_persisted = bool(reflection_round_trip) and all(
+    check["persisted"] for check in reflection_round_trip)
+  reflection_reloaded = bool(reflection_round_trip) and all(
+    check["reloaded"] for check in reflection_round_trip)
+  reflection_lineage_verified = bool(reflection_round_trip) and all(
+    check["evidence_preserved"] for check in reflection_round_trip)
+  reflection_retrieval_eligible_after_reload = bool(reflection_round_trip) and all(
+    check["reloaded"] and check["in_seq_thought_after_reload"]
+    and check["embedding_available_after_reload"]
+    for check in reflection_round_trip)
+  reflection_exclusive_cost = {
+    caller: {
+      "physical_attempts": sum(
+        1 for event in events if event.caller_id == caller),
+      "input_tokens": sum(
+        event.input_tokens or 0 for event in events
+        if event.caller_id == caller),
+      "output_tokens": sum(
+        event.output_tokens or 0 for event in events
+        if event.caller_id == caller),
+      "cost_usd": sum(
+        (record.estimated_total_cost_usd or Decimal("0")
+         for record in cost_records if record.caller_id == caller),
+        Decimal("0")),
+    } for caller in R1REF_EXCLUSIVE_REFLECTION_CALLERS
+  }
+  reflection_report = {
+    "observation_enabled": reflection_observation_enabled,
+    "importance_trigger_max_by_actor": (
+      reflection_observer.importance_trigger_max_by_actor
+      if reflection_observer else {}),
+    "trigger_checks": (
+      reflection_observer.trigger_checks if reflection_observer else []),
+    "natural_trigger_observed": any(
+      check["triggered"]
+      for check in (
+        reflection_observer.trigger_checks if reflection_observer else [])),
+    "focal_points": (
+      reflection_observer.focal_points if reflection_observer else []),
+    "retrieval_events": (
+      reflection_observer.retrieval_events if reflection_observer else []),
+    "insights": (
+      reflection_observer.insights if reflection_observer else []),
+    "insight_attempt_diagnostics": (
+      reflection_observer.insight_attempt_diagnostics
+      if reflection_observer else []),
+    "insight_contract_failures": (
+      reflection_observer.insight_contract_failures
+      if reflection_observer else []),
+    "reflection_thoughts_created": reflection_thoughts_created,
+    "conversation_followup_thoughts_created":
+      conversation_followup_thoughts_created,
+    "round_trip_checks": reflection_round_trip,
+    "reflection_persisted": reflection_persisted,
+    "reflection_reloaded": reflection_reloaded,
+    "lineage_verified": reflection_lineage_verified,
+    "reflection_retrieval_eligible_after_reload":
+      reflection_retrieval_eligible_after_reload,
+    "ranking_state_fidelity": (
+      "NOT_FULLY_GUARANTEED" if reflection_observation_enabled else None),
+    "reflection_exclusive_caller_cost": reflection_exclusive_cost,
+    "shared_caller_attribution_note": (
+      "event_poignancy (perceive.py + reflect.py) and event_triple "
+      "(reflect.py + plan.py + converse.py) share their wrapper across "
+      "cognitive stages and cannot be exclusively attributed to "
+      "reflection by caller_id alone; only focal_pt and "
+      "insight_and_guidance are reflection-exclusive callers."),
+    "later_reflection_retrieved": False,
+    "later_reflection_consumed": False,
+  }
   retrieved_derived_refs = {
     node_ref for event in retrieval_events
     for node_ref in event[
@@ -2342,6 +2741,8 @@ def _execute_modern_smallville(
                  resume is None or (
                    resume_hydration.get("all_checks_passed", False)
                    and source_hash_before == _tree_sha256(source))))
+  reflection_report["verdict"] = _reflection_lifecycle_verdict(
+    reflection_report, run_error=error, run_success=success)
   r1m3b_policy = (
     config.ticks == 5 and config.cognitive_actors == VISIBLE_ACTORS
     and not config.passive_actors)
@@ -2435,6 +2836,7 @@ def _execute_modern_smallville(
       "old_environment_hashes": resume.environment_hashes,
     }),
     "causal_resume": causal_report,
+    "reflection_lifecycle": reflection_report,
     "actor_policy": {"cognitive": config.cognitive_actors,
                      "passive": config.passive_actors,
                      "visible": config.visible_actors},
@@ -2586,6 +2988,10 @@ def build_parser() -> argparse.ArgumentParser:
   run.add_argument(
     "--controlled-proximity", action="store_true",
     help="use the isolated daytime R1M3-C encounter fixture")
+  run.add_argument(
+    "--observe-reflection-lifecycle", action="store_true",
+    help="read-only observation of the natural reflection trigger, "
+         "focal points, retrieval, insights, and Thought lineage")
   resume = commands.add_parser(
     "resume", help="continue a validated persisted modern run")
   resume.add_argument("--from", dest="source_run", type=Path, required=True)
@@ -2596,6 +3002,10 @@ def build_parser() -> argparse.ArgumentParser:
   resume.add_argument(
     "--observe-causal-social-memory", action="store_true",
     help="observe persisted Chat-derived Event/Thought social cognition")
+  resume.add_argument(
+    "--observe-reflection-lifecycle", action="store_true",
+    help="read-only observation of the natural reflection trigger, "
+         "focal points, retrieval, insights, and Thought lineage")
   return parser
 
 
@@ -2643,7 +3053,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         source_run=args.source_run,
         run_name=args.name or generate_run_name(), ticks=args.ticks,
         cost_ceiling_usd=args.cost_ceiling,
-        observe_causal_social_memory=args.observe_causal_social_memory)
+        observe_causal_social_memory=args.observe_causal_social_memory,
+        observe_reflection_lifecycle=args.observe_reflection_lifecycle)
       result = run_modern_smallville_resume(config)
     else:
       cognitive_actors = (
@@ -2658,6 +3069,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         cognitive_actors=cognitive_actors,
         passive_actors=passive_actors,
         controlled_proximity=args.controlled_proximity,
+        observe_reflection_lifecycle=args.observe_reflection_lifecycle,
       )
       result = run_modern_smallville(config)
   except ModernRunConfigurationError as error:
