@@ -1,5 +1,5 @@
 from contextlib import ExitStack
-from dataclasses import FrozenInstanceError
+from dataclasses import asdict, FrozenInstanceError
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +39,9 @@ from persona.prompt_template.llm_provider import (
   use_embedding_provider,
   use_llm_replay_context,
 )
+from persona.prompt_template.modern_openai_provider import (
+  LLMIncompleteResponseError,
+)
 from persona.prompt_template.replay_cost_guard import (
   ReplayCostAccountingUnavailableError,
   ReplayCostCeiling,
@@ -60,6 +63,10 @@ CHAT_MODEL = "r0-chat"
 COMPAT_MODEL = "r0-completion-compat"
 EMBEDDING_MODEL = "text-embedding-ada-002"
 SIMULATION_ID = "ego-vivens-lab-01"
+
+
+class KnownSyntheticError(RuntimeError):
+  pass
 
 
 class RecordingUsageProvider:
@@ -289,6 +296,9 @@ class ReplayCostGuardTests(unittest.TestCase):
       with self.assertRaises(ReplayCostAccountingUnavailableError):
         self.chat()
       self.assertTrue(state.snapshot().tripped)
+      diagnostic = state.accounting_failure_diagnostic()
+      self.assertEqual("TELEMETRY_EVENT", diagnostic.failure_stage)
+      self.assertEqual("PARTIAL", diagnostic.usage_shape)
 
   def test_12_provider_error_without_usage_trips_fail_closed(self):
     provider = RecordingUsageProvider(fail=True)
@@ -436,6 +446,11 @@ class ReplayCostGuardTests(unittest.TestCase):
       with self.assertRaises(ReplayCostAccountingUnavailableError):
         self.chat()
       self.assertTrue(state.snapshot().tripped)
+      diagnostic = state.accounting_failure_diagnostic()
+      self.assertEqual("PRICING_RESOLUTION", diagnostic.failure_stage)
+      self.assertEqual("COMPLETE", diagnostic.usage_shape)
+      self.assertEqual("COMPLETE", diagnostic.usage_validation_category)
+      self.assertEqual("UNAVAILABLE", diagnostic.pricing_status)
 
   def test_24_legacy_completion_is_blocked_pre_provider(self):
     provider = RecordingUsageProvider()
@@ -526,6 +541,110 @@ class ReplayCostGuardTests(unittest.TestCase):
     self.assertEqual(1, len(provider.calls))
     self.assertEqual(before.physical_attempts, after.physical_attempts)
     self.assertEqual(before.accumulated_cost, after.accumulated_cost)
+
+  def test_30_complete_usage_keeps_accounting_and_diagnostics_unchanged(self):
+    provider = RecordingUsageProvider(usage=[(3, 2)])
+    with self.providers(provider), use_llm_replay_context(self.context()), (
+        use_replay_cost_guard(self.config())) as state:
+      self.chat()
+      self.assertIsNone(state.accounting_failure_diagnostic())
+      self.assertFalse(state.snapshot().tripped)
+      self.assertEqual(Decimal("5.000000000000"),
+                       state.snapshot().accumulated_cost)
+
+  def test_31_missing_usage_exposes_diagnostic_and_stays_fail_closed(self):
+    provider = RecordingUsageProvider(usage=[(None, None)])
+    with self.providers(provider), use_llm_replay_context(self.context()), (
+        use_replay_cost_guard(self.config())) as state:
+      with self.assertRaises(ReplayCostAccountingUnavailableError) as raised:
+        self.chat()
+      diagnostic = state.accounting_failure_diagnostic()
+      self.assertIs(diagnostic, raised.exception.diagnostic)
+      self.assertEqual("USAGE_VALIDATION", diagnostic.failure_stage)
+      self.assertEqual("SUCCESS", diagnostic.provider_outcome)
+      self.assertEqual("NORMALIZED_RESULT", diagnostic.normalized_result_type)
+      self.assertFalse(diagnostic.usage_present)
+      self.assertEqual("ABSENT", diagnostic.usage_shape)
+      self.assertEqual("UNAVAILABLE", diagnostic.usage_validation_category)
+      self.assertEqual("PARTIAL", diagnostic.pricing_status)
+      self.assertIsNone(diagnostic.original_exception_type)
+      with self.assertRaises(ReplayCostGuardAlreadyTrippedError):
+        self.embed()
+    self.assertEqual(1, len(provider.calls))
+
+  def test_32_partial_usage_is_distinct_from_absent_usage(self):
+    provider = RecordingUsageProvider(usage=[(3, None)])
+    with self.providers(provider), use_llm_replay_context(self.context()), (
+        use_replay_cost_guard(self.config())) as state:
+      with self.assertRaises(ReplayCostAccountingUnavailableError):
+        self.compat()
+      diagnostic = state.accounting_failure_diagnostic()
+    self.assertEqual("USAGE_VALIDATION", diagnostic.failure_stage)
+    self.assertTrue(diagnostic.usage_present)
+    self.assertEqual("PARTIAL", diagnostic.usage_shape)
+    self.assertEqual(3, diagnostic.input_tokens)
+    self.assertIsNone(diagnostic.output_tokens)
+    self.assertEqual("PARTIAL", diagnostic.usage_validation_category)
+
+  def test_33_provider_error_is_separate_from_usage_validation(self):
+    provider = RecordingUsageProvider(fail=True)
+    with self.providers(provider), use_llm_replay_context(self.context()), (
+        use_replay_cost_guard(self.config())) as state:
+      with self.assertRaises(ReplayCostAccountingUnavailableError):
+        self.chat()
+      diagnostic = state.accounting_failure_diagnostic()
+    self.assertEqual("PROVIDER_ATTEMPT", diagnostic.failure_stage)
+    self.assertEqual("ERROR", diagnostic.provider_outcome)
+    self.assertEqual("RuntimeError", diagnostic.provider_error_type)
+    self.assertIsNone(diagnostic.normalized_error_type)
+    self.assertEqual("ABSENT", diagnostic.usage_shape)
+
+  def test_34_builder_error_preserves_type_without_content(self):
+    provider = RecordingUsageProvider(usage=[(3, 2)])
+    secret = "secret prompt secret response API key memory content"
+    with self.providers(provider), use_llm_replay_context(self.context()), (
+        use_replay_cost_guard(self.config())) as state, patch(
+          "persona.prompt_template.replay_cost_guard."
+          "build_cost_ledger_records",
+          side_effect=KnownSyntheticError(secret)):
+      with self.assertRaises(ReplayCostAccountingUnavailableError) as raised:
+        self.chat()
+      diagnostic = state.accounting_failure_diagnostic()
+      self.assertIsInstance(raised.exception.__cause__, KnownSyntheticError)
+      self.assertIs(diagnostic, raised.exception.diagnostic)
+      self.assertEqual("LEDGER_RECORD_BUILD", diagnostic.failure_stage)
+      self.assertEqual("KnownSyntheticError",
+                       diagnostic.original_exception_type)
+      self.assertEqual("COMPLETE", diagnostic.usage_shape)
+      self.assertEqual("ledger record construction raised",
+                       diagnostic.sanitized_exception_message)
+      self.assertNotIn(secret, repr(asdict(diagnostic)))
+      with self.assertRaises(ReplayCostGuardAlreadyTrippedError):
+        self.embed()
+    self.assertEqual(1, len(provider.calls))
+
+  def test_35_normalization_error_has_distinct_failure_stage(self):
+    provider = RecordingUsageProvider()
+
+    def fail_normalization(*args, **kwargs):
+      provider.calls.append((CHAT, CHAT_MODEL))
+      raise LLMIncompleteResponseError(
+        "secret response", response_model=CHAT_MODEL,
+        response_status="incomplete", finish_reason="length")
+
+    provider.chat_completion = fail_normalization
+    with self.providers(provider), use_llm_replay_context(self.context()), (
+        use_replay_cost_guard(self.config())) as state:
+      with self.assertRaises(ReplayCostAccountingUnavailableError):
+        self.chat()
+      diagnostic = state.accounting_failure_diagnostic()
+    self.assertEqual("PROVIDER_NORMALIZATION", diagnostic.failure_stage)
+    self.assertEqual("LLMIncompleteResponseError",
+                     diagnostic.normalized_error_type)
+    self.assertIsNone(diagnostic.provider_error_type)
+    self.assertEqual(CHAT_MODEL, diagnostic.response_model)
+    self.assertEqual("length", diagnostic.finish_reason)
+    self.assertNotIn("secret response", repr(asdict(diagnostic)))
 
 
 if __name__ == "__main__":

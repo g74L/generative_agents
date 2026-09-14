@@ -1,6 +1,8 @@
 import datetime
+from contextlib import ExitStack
 from decimal import Decimal
 import json
+import shutil
 from pathlib import Path
 import socket
 import tempfile
@@ -17,6 +19,8 @@ if str(BACKEND) not in sys.path:
 
 import controlled_replay
 import modern_smallville as subject
+from persona import persona as persona_module
+from persona.cognitive_modules import plan as plan_module
 from persona.cognitive_modules import reflect as reflect_module
 from persona.prompt_template import gpt_structure, run_gpt_prompt
 from persona.memory_structures.associative_memory import AssociativeMemory
@@ -142,6 +146,446 @@ class ModernRunConfigTests(unittest.TestCase):
           run_name="bad-controlled", controlled_proximity=True, **values)
 
 
+class SourceActorRegistryTests(unittest.TestCase):
+  START_TIME = datetime.datetime(2023, 2, 13, 5, 55, 0)
+
+  def setUp(self):
+    self.temporary = tempfile.TemporaryDirectory()
+    self.addCleanup(self.temporary.cleanup)
+    self.root = Path(self.temporary.name)
+    self.source = subject.SOURCE_ROOT / "base_the_ville_n25"
+    self.names = subject.load_source_actor_registry(self.source)
+
+  def config(self, **changes):
+    values = dict(source_simulation="base_the_ville_n25",
+                  run_name="source-registry", actor_registry="source",
+                  visible_actors=self.names, cognitive_actors=self.names,
+                  passive_actors=())
+    values.update(changes)
+    return subject.ModernRunConfig(**values)
+
+  def test_n25_exact_registry_and_all_cognitive_policy(self):
+    meta = subject._read_json(self.source / "reverie" / "meta.json")
+    self.assertEqual(25, len(self.names))
+    self.assertEqual(tuple(meta["persona_names"]), self.names)
+    config = self.config()
+    self.assertEqual(self.names, config.visible_actors)
+    self.assertEqual(self.names, config.cognitive_actors)
+    self.assertEqual((), config.passive_actors)
+
+  def test_source_alone_does_not_opt_in_or_use_provider(self):
+    config = subject.ModernRunConfig(source_simulation="base_the_ville_n25")
+    self.assertEqual(subject.VISIBLE_ACTORS, config.visible_actors)
+    with patch.object(subject, "_default_adapter") as provider:
+      with self.assertRaises(subject.ModernRunConfigurationError):
+        subject.run_modern_smallville(config, runtime_root=self.root)
+    provider.assert_not_called()
+
+  def test_source_policy_rejects_passive_actors_and_controlled_proximity(self):
+    for changes in ({"passive_actors": (self.names[-1],)},
+                    {"cognitive_actors": self.names[:-1]},
+                    {"controlled_proximity": True},
+                    {"actor_registry": "default"}):
+      with self.subTest(changes=changes), self.assertRaises(
+          subject.ModernRunConfigurationError):
+        self.config(**changes)
+
+  def test_start_time_requires_source_registry_and_timezone_free_datetime(self):
+    invalid = (
+      {"start_time": self.START_TIME},
+      {"actor_registry": "source", "visible_actors": self.names,
+       "cognitive_actors": self.names, "passive_actors": (),
+       "start_time": "2023-02-13T05:55:00"},
+      {"actor_registry": "source", "visible_actors": self.names,
+       "cognitive_actors": self.names, "passive_actors": (),
+       "start_time": self.START_TIME.replace(tzinfo=datetime.timezone.utc)},
+    )
+    for values in invalid:
+      with self.subTest(values=values), self.assertRaises(
+          subject.ModernRunConfigurationError):
+        subject.ModernRunConfig(run_name="bad-start-time", **values)
+    with self.assertRaisesRegex(
+        subject.ModernRunConfigurationError, "controlled proximity"):
+      self.config(start_time=self.START_TIME, controlled_proximity=True)
+
+  def test_start_time_override_changes_only_isolated_world_meta(self):
+    isolated = self.root / "isolated"
+    shutil.copytree(self.source, isolated)
+    source_before = subject._tree_sha256(self.source)
+    meta_before = subject._read_json(isolated / "reverie" / "meta.json")
+    environment_before = (isolated / "environment" / "0.json").read_bytes()
+    file_hashes_before = {
+      path.relative_to(isolated).as_posix(): subject._file_sha256(path)
+      for path in isolated.rglob("*") if path.is_file()}
+    scratch_before = {
+      name: (isolated / "personas" / name / "bootstrap_memory"
+             / "scratch.json").read_bytes()
+      for name in self.names}
+
+    evidence = subject._override_isolated_source_start_time(
+      isolated, self.START_TIME)
+
+    meta_after = subject._read_json(isolated / "reverie" / "meta.json")
+    expected_meta = dict(meta_before)
+    expected_meta["curr_time"] = "February 13, 2023, 05:55:00"
+    self.assertEqual(expected_meta, meta_after)
+    self.assertEqual(0, meta_after["step"])
+    self.assertEqual(self.names, tuple(meta_after["persona_names"]))
+    self.assertEqual({
+      "requested_start_time": self.START_TIME,
+      "effective_start_time": "February 13, 2023, 05:55:00",
+      "step": 0,
+    }, evidence)
+    self.assertEqual(
+      environment_before, (isolated / "environment" / "0.json").read_bytes())
+    for name in self.names:
+      scratch_path = (isolated / "personas" / name / "bootstrap_memory"
+                      / "scratch.json")
+      self.assertEqual(scratch_before[name], scratch_path.read_bytes())
+      scratch = subject._read_json(scratch_path)
+      self.assertIsNone(scratch["curr_time"])
+    file_hashes_after = {
+      path.relative_to(isolated).as_posix(): subject._file_sha256(path)
+      for path in isolated.rglob("*") if path.is_file()}
+    self.assertEqual(file_hashes_before.keys(), file_hashes_after.keys())
+    self.assertEqual(
+      ["reverie/meta.json"],
+      [name for name in file_hashes_before
+       if file_hashes_before[name] != file_hashes_after[name]])
+    self.assertEqual(source_before, subject._tree_sha256(self.source))
+
+  def test_start_time_cli_is_strict_and_not_available_to_resume(self):
+    parser = subject.build_parser()
+    args = parser.parse_args([
+      "run", "--source", "base_the_ville_n25",
+      "--actor-registry", "source",
+      "--start-time", "2023-02-13T05:55:00"])
+    self.assertEqual(self.START_TIME, args.start_time)
+    for value in ("invalid", "2023-02-30T05:55:00",
+                  "2023-02-13", "2023-02-13T05:55:00+01:00"):
+      with self.subTest(value=value), self.assertRaises(SystemExit):
+        parser.parse_args(["run", "--start-time", value])
+    with self.assertRaises(SystemExit):
+      parser.parse_args([
+        "resume", "--from", "run", "--start-time",
+        "2023-02-13T05:55:00"])
+
+  def test_invalid_start_time_fails_before_provider_or_source_mutation(self):
+    before = subject._tree_sha256(self.source)
+    with patch.object(subject, "_default_adapter") as provider, \
+        self.assertRaises(SystemExit):
+      subject.main([
+        "run", "--source", "base_the_ville_n25",
+        "--actor-registry", "source", "--start-time", "invalid"])
+    provider.assert_not_called()
+    self.assertEqual(before, subject._tree_sha256(self.source))
+
+  def test_start_time_mode_conflicts_fail_before_runtime(self):
+    cases = (
+      ["run", "--start-time", "2023-02-13T05:55:00"],
+      ["run", "--source", "base_the_ville_n25",
+       "--actor-registry", "source", "--controlled-proximity",
+       "--start-time", "2023-02-13T05:55:00"],
+    )
+    for args in cases:
+      with self.subTest(args=args), patch.object(
+          subject, "run_modern_smallville") as runner:
+        self.assertEqual(2, subject.main(args))
+        runner.assert_not_called()
+
+  def test_invalid_source_names_fail_closed(self):
+    meta = subject._read_json(self.source / "reverie" / "meta.json")
+    for names in ([], None, "Latoya Williams", [""], [None], [[]],
+                  ["../outside"], ["  "], ["Latoya Williams"] * 2):
+      with self.subTest(names=names), self.assertRaises(
+          subject.ModernRunConfigurationError):
+        subject.load_source_actor_registry(self.source, {**meta, "persona_names": names})
+
+  def test_missing_persona_directory_and_environment_actor_fail_closed(self):
+    source = self.root / "source"
+    shutil.copytree(self.source, source)
+    persona = source / "personas" / self.names[-1]
+    renamed = persona.with_name("omitted-persona")
+    persona.rename(renamed)
+    with self.assertRaisesRegex(subject.ModernRunConfigurationError, "directory"):
+      subject.load_source_actor_registry(source)
+    renamed.rename(persona)
+    path = source / "environment" / "0.json"
+    environment = subject._read_json(path)
+    del environment[self.names[-1]]
+    subject._write_json(path, environment)
+    with self.assertRaisesRegex(subject.ModernRunConfigurationError, "environment actor"):
+      subject.load_source_actor_registry(source)
+
+  def test_config_order_must_match_source_before_provider_use(self):
+    config = self.config(visible_actors=tuple(reversed(self.names)),
+                         cognitive_actors=tuple(reversed(self.names)))
+    with patch.object(subject, "_default_adapter") as provider:
+      with self.assertRaises(subject.ModernRunConfigurationError):
+        subject.run_modern_smallville(config, runtime_root=self.root)
+    provider.assert_not_called()
+
+  def test_cli_source_opt_in_and_existing_isabella_policy(self):
+    for flags, expected, mode in (
+        (["--source", "base_the_ville_n25", "--actor-registry", "source"],
+         self.names, "source"),
+        (["--cognitive", "isabella"], (subject.COGNITIVE_ACTOR,), "default")):
+      with self.subTest(mode=mode), patch.object(
+          subject, "run_modern_smallville",
+          side_effect=subject.ModernRunConfigurationError("capture")) as runner:
+        self.assertEqual(2, subject.main(["run", *flags]))
+        config = runner.call_args.args[0]
+        self.assertEqual(expected, config.cognitive_actors)
+        self.assertEqual(mode, config.actor_registry)
+    with self.assertRaises(SystemExit):
+      subject.build_parser().parse_args([
+        "run", "--actor-registry", "source", "--cognitive", "isabella"])
+
+  def test_real_n25_hydration_preflight_and_initial_save_reload(self):
+    before = subject._tree_sha256(self.source)
+    meta = subject._read_json(self.source / "reverie" / "meta.json")
+    environment = subject._read_json(self.source / "environment" / "0.json")
+    module = subject._load_reverie_module()
+    observed = []
+
+    def inspect_before_tick(server, ticks):
+      self.assertEqual(1, ticks)
+      self.assertEqual(self.names, tuple(server.personas))
+      self.assertEqual(0, server.step)
+      self.assertEqual(datetime.datetime(2023, 2, 13), server.curr_time)
+      self.assertEqual("Maze", type(server.maze).__name__)
+      for name, persona in server.personas.items():
+        self.assertIsNone(persona.scratch.curr_time)
+        self.assertEqual((environment[name]["x"], environment[name]["y"]),
+                         server.personas_tile[name])
+      self.assertTrue(all(subject._actor_object_isolation(
+        server.personas, self.names, Path(module.fs_storage) / server.sim_code).values()))
+      server.save()
+      reloaded = module.ReverieServer(server.sim_code, "n25-initial-reload")
+      self.assertEqual(self.names, tuple(reloaded.personas))
+      self.assertEqual(server.curr_time, reloaded.curr_time)
+      self.assertEqual(server.step, reloaded.step)
+      for name in self.names:
+        self.assertEqual(subject._actor_state_metadata(server.personas[name]),
+                         subject._actor_state_metadata(reloaded.personas[name]))
+        self.assertIsNone(reloaded.personas[name].scratch.curr_time)
+      observed.append(len(reloaded.personas))
+      raise RuntimeError("structural probe stops before cognition")
+
+    adapter = ModernTickFakeAdapter()
+    with patch.object(subject, "_load_reverie_module", return_value=module), \
+        patch.object(module.ReverieServer, "start_server", inspect_before_tick), \
+        patch.object(subject, "_bootstrap_isolated_temporal_source") as bootstrap, \
+        patch.object(socket.socket, "connect", side_effect=AssertionError("network forbidden")):
+      result = subject.run_modern_smallville(
+        self.config(), adapter=adapter, runtime_root=self.root / "runs")
+    self.assertEqual([25], observed)
+    self.assertEqual("structural probe stops before cognition", result.exception_message)
+    self.assertEqual([], adapter.calls)
+    bootstrap.assert_not_called()
+    report = subject._read_json(result.run_directory / "report.json")
+    self.assertEqual(list(self.names), report["actor_policy"]["visible"])
+    self.assertEqual([controlled_replay.EMPTY_BOOTSTRAPPABLE] * 25,
+                     report["embedding_preflight"]["before"])
+    self.assertEqual([controlled_replay.MODERN_COMPATIBLE] * 25,
+                     report["embedding_preflight"]["after"])
+    self.assertEqual(list(self.names),
+                     report["embedding_preflight"]["bootstrapped_personas"])
+    self.assertEqual({name: 0 for name in self.names}, dict(result.actor_move_counts))
+    isolated = result.run_directory / "fixture" / "storage" / "source-registry-source"
+    self.assertEqual(meta, subject._read_json(isolated / "reverie" / "meta.json"))
+    for name in self.names:
+      relative = Path("personas") / name / "bootstrap_memory"
+      for filename in ("scratch.json", "spatial_memory.json"):
+        self.assertEqual((self.source / relative / filename).read_bytes(),
+                         (isolated / relative / filename).read_bytes())
+    audits = controlled_replay.prepare_isolated_embedding_stores(
+      controlled_replay.prepare_isolated_reverie_fixture(
+        isolated, result.run_directory / "fixture", self.source, 0), self.names)
+    self.assertEqual(25, len(audits.audits_after))
+    self.assertEqual((), audits.bootstrapped_personas)
+    self.assertTrue(report["fixture"]["source_unchanged"])
+    self.assertEqual(before, subject._tree_sha256(self.source))
+
+  def test_real_n25_start_time_preserves_native_pre_move_state_and_reports(self):
+    before = subject._tree_sha256(self.source)
+    source_meta = subject._read_json(self.source / "reverie" / "meta.json")
+    source_environment = (self.source / "environment" / "0.json").read_bytes()
+    scratch_before = {
+      name: (self.source / "personas" / name / "bootstrap_memory"
+             / "scratch.json").read_bytes()
+      for name in self.names}
+    module = subject._load_reverie_module()
+    observed = []
+
+    def inspect_before_tick(server, ticks):
+      self.assertEqual(1, ticks)
+      self.assertEqual(self.names, tuple(server.personas))
+      self.assertEqual(0, server.step)
+      self.assertEqual(self.START_TIME, server.curr_time)
+      for persona in server.personas.values():
+        self.assertIsNone(persona.scratch.curr_time)
+      observed.append((server.step, server.curr_time, len(server.personas)))
+      raise RuntimeError("start-time probe stops before cognition")
+
+    adapter = ModernTickFakeAdapter()
+    with patch.object(subject, "_load_reverie_module", return_value=module), \
+        patch.object(module.ReverieServer, "start_server", inspect_before_tick), \
+        patch.object(subject, "_bootstrap_isolated_temporal_source") as bootstrap, \
+        patch.object(socket.socket, "connect",
+                     side_effect=AssertionError("network forbidden")):
+      result = subject.run_modern_smallville(
+        self.config(start_time=self.START_TIME), adapter=adapter,
+        runtime_root=self.root / "runs")
+
+    self.assertEqual([(0, self.START_TIME, 25)], observed)
+    self.assertEqual([], adapter.calls)
+    bootstrap.assert_not_called()
+    self.assertEqual("start-time probe stops before cognition",
+                     result.exception_message)
+    report = subject._read_json(result.run_directory / "report.json")
+    self.assertEqual("February 13, 2023, 05:55:00",
+                     report["config"]["start_time"])
+    self.assertEqual("February 13, 2023, 05:55:00",
+                     report["result"]["initial_time"])
+    self.assertEqual("February 13, 2023, 05:55:00",
+                     report["fixture"]["seed"]["effective_start_time"])
+    self.assertTrue(report["fixture"]["source_unchanged"])
+
+    isolated = (result.run_directory / "fixture" / "storage"
+                / "source-registry-source")
+    isolated_meta = subject._read_json(isolated / "reverie" / "meta.json")
+    expected_meta = dict(source_meta)
+    expected_meta["curr_time"] = "February 13, 2023, 05:55:00"
+    self.assertEqual(expected_meta, isolated_meta)
+    self.assertEqual(
+      source_environment, (isolated / "environment" / "0.json").read_bytes())
+    for name in self.names:
+      scratch_path = (isolated / "personas" / name / "bootstrap_memory"
+                      / "scratch.json")
+      self.assertEqual(scratch_before[name], scratch_path.read_bytes())
+      scratch = subject._read_json(scratch_path)
+      for field in (
+          "curr_time", "daily_plan_req", "daily_req", "f_daily_schedule",
+          "act_address", "act_description", "act_event", "planned_path"):
+        self.assertEqual(
+          subject._read_json(
+            self.source / "personas" / name / "bootstrap_memory"
+            / "scratch.json")[field], scratch[field])
+    self.assertEqual(before, subject._tree_sha256(self.source))
+
+  def test_source_order_drives_real_tick_reports_reload_and_resume(self):
+    # Reuse the established R1V seed on a disposable three-person copy.
+    # This exercises the complete harness without inventing N25 fake cognition.
+    source = self.root / "ordered-source"
+    shutil.copytree(subject.SOURCE_ROOT / subject.DEFAULT_SOURCE, source)
+    subject._bootstrap_isolated_temporal_source(source, subject.VISIBLE_ACTORS)
+    names = tuple(reversed(subject.VISIBLE_ACTORS))
+    path = source / "reverie" / "meta.json"
+    meta = subject._read_json(path)
+    meta["persona_names"] = list(names)
+    subject._write_json(path, meta)
+    before = subject._tree_sha256(source)
+    with patch.object(subject, "SOURCE_ROOT", self.root):
+      result = subject.run_modern_smallville(
+        self.config(source_simulation=source.name, visible_actors=names,
+                    cognitive_actors=names), adapter=ModernTickFakeAdapter(),
+        runtime_root=self.root / "runs")
+      self.assertEqual("MODERN_SMALLVILLE_HEADLESS_RUN_PASSED", result.verdict,
+                       result.exception_message)
+      report = subject._read_json(result.run_directory / "report.json")
+      self.assertEqual(names, tuple(name for name, _ in result.actor_move_counts))
+      for key in ("continuity", "movement_integrity", "multi_actor_isolation"):
+        self.assertTrue(report[key]["all_checks_passed"])
+      self.assertTrue(report["telemetry"]["attribution_valid"])
+      self.assertEqual(set(names), set(report["tick_progression"][0]["actors"]))
+      self.assertEqual(3, report["reload"]["persona_count"])
+      resumed = subject.run_modern_smallville_resume(
+        subject.ModernResumeConfig(source_run=result.run_directory,
+                                   run_name="resumed-source", ticks=1),
+        adapter=ModernTickFakeAdapter(), runtime_root=self.root / "runs")
+    self.assertEqual(subject.R1CLI_A2_A_READY_VERDICT, resumed.verdict,
+                     resumed.exception_message)
+    self.assertEqual(names, resumed.cognitive_actors)
+    self.assertEqual((), resumed.passive_actors)
+    self.assertTrue(resumed.reload_passed)
+    self.assertEqual(before, subject._tree_sha256(source))
+
+
+class ActorStateDailyPlanInvariantTests(unittest.TestCase):
+  @staticmethod
+  def _persona(daily_plan_req, daily_req, name="Synthetic Actor"):
+    return SimpleNamespace(
+      name=name,
+      scratch=SimpleNamespace(
+        name=name, daily_plan_req=daily_plan_req, daily_req=daily_req,
+        f_daily_schedule=[["synthetic activity", 1440]],
+        act_description="synthetic activity",
+        act_address="the Ville:synthetic sector:synthetic arena:object",
+        act_event=(name, "is", "active"),
+        act_start_time=datetime.datetime(2023, 2, 13), act_duration=60),
+      a_mem=SimpleNamespace(
+        id_to_node={}, embeddings={}, seq_event=[], seq_thought=[], seq_chat=[]),
+      s_mem=SimpleNamespace(tree={}))
+
+  def test_daily_plan_presence_uses_generated_plan_only(self):
+    cases = (
+      ("", ["generated plan"], True),
+      ("optional requirement", [], False),
+      ("optional requirement", ["generated plan"], True),
+      ("", [], False),
+    )
+    for daily_plan_req, daily_req, expected in cases:
+      with self.subTest(
+          daily_plan_req=bool(daily_plan_req), daily_req=bool(daily_req)):
+        state = subject._actor_state_metadata(
+          self._persona(daily_plan_req, daily_req))
+        self.assertIs(expected, state["daily_plan_present"])
+
+  def test_n25_requirement_partition_does_not_control_plan_presence(self):
+    source = subject.SOURCE_ROOT / "base_the_ville_n25"
+    expected_requirement = {
+      "Latoya Williams": False,
+      "Rajiv Patel": False,
+      "Abigail Chen": False,
+      "Adam Smith": False,
+      "Carmen Ortiz": True,
+    }
+    for name, requirement_present in expected_requirement.items():
+      scratch = subject._read_json(
+        source / "personas" / name / "bootstrap_memory" / "scratch.json")
+      self.assertIs(requirement_present, bool(scratch["daily_plan_req"]))
+      with self.subTest(name=name, generated_plan="present"):
+        self.assertTrue(subject._actor_state_metadata(self._persona(
+          scratch["daily_plan_req"], ["generated plan"], name))[
+            "daily_plan_present"])
+      with self.subTest(name=name, generated_plan="absent"):
+        self.assertFalse(subject._actor_state_metadata(self._persona(
+          scratch["daily_plan_req"], [], name))["daily_plan_present"])
+
+  def test_first_day_planning_writes_generated_plan_and_preserves_requirement(self):
+    persona = self._persona("", [])
+    persona.scratch.curr_time = datetime.datetime(2023, 2, 13)
+    added_thoughts = []
+    persona.a_mem.add_thought = lambda *args: added_thoughts.append(args)
+    with patch.object(plan_module, "generate_wake_up_hour", return_value=7), \
+        patch.object(plan_module, "generate_first_daily_plan",
+                     return_value=["generated plan"]), \
+        patch.object(plan_module, "generate_hourly_schedule",
+                     return_value=[["synthetic activity", 1440]]), \
+        patch.object(plan_module, "get_embedding", return_value=[0.0]):
+      plan_module._long_term_planning(persona, "First day")
+    self.assertEqual("", persona.scratch.daily_plan_req)
+    self.assertEqual(["generated plan"], persona.scratch.daily_req)
+    self.assertEqual([["synthetic activity", 1440]],
+                     persona.scratch.f_daily_schedule)
+    self.assertEqual(persona.scratch.f_daily_schedule,
+                     persona.scratch.f_daily_schedule_hourly_org)
+    self.assertEqual(1, len(added_thoughts))
+    self.assertTrue(subject._actor_state_metadata(persona)[
+      "daily_plan_present"])
+
+
 class ModernResumeConfigTests(unittest.TestCase):
   def test_resume_config_is_explicit_and_valid(self):
     config = subject.ModernResumeConfig(
@@ -251,6 +695,311 @@ class FailureCallerAttributionTests(unittest.TestCase):
       reloaded = subject._read_json(path)
       self.assertIsNone(reloaded["failure"]["caller"])
       self.assertIsNone(reloaded["failure"]["operation"])
+
+  def test_accounting_diagnostic_round_trips_without_private_content(self):
+    diagnostic = subject.AccountingFailureDiagnostic(
+      schema_version=1,
+      operation="COMPLETION_COMPAT", model="gpt-4o-mini",
+      response_model="gpt-4o-mini-2024-07-18",
+      caller_id="generate_hourly_schedule", cognitive_category="WORLD_TICK",
+      actor_id="Ayesha Khan", simulation_id="synthetic-offline-run",
+      simulation_step=0, logical_call_id="logical-safe-id",
+      physical_attempt=1, provider_outcome="ERROR",
+      provider_error_type=None, normalized_result_type=None,
+      normalized_error_type="LLMIncompleteResponseError",
+      request_id="req-safe-id", finish_reason="length",
+      response_status="incomplete", usage_present=True,
+      usage_shape="PARTIAL", input_tokens=20, output_tokens=None,
+      cached_input_tokens=None, reasoning_tokens=None,
+      usage_validation_category="PARTIAL", pricing_status="PARTIAL",
+      failure_stage="PROVIDER_NORMALIZATION",
+      original_exception_type=None,
+      sanitized_exception_message="estimated total cost is unavailable",
+      guard_classification="ACCOUNTING_UNAVAILABLE",
+      guard_action="TRIPPED_AND_RAISED")
+    error = subject.ReplayCostAccountingUnavailableError(
+      diagnostic.operation, diagnostic.model, diagnostic)
+    result = self._result()
+    result = subject.ModernRunResult(
+      **{**result.__dict__,
+         "exception_type": type(error).__name__,
+         "exception_message": str(error)})
+    failure = subject._build_failure_report(
+      self._execution_state(), result, error)
+    forbidden = (
+      "secret prompt", "secret response", "API key", "memory content")
+    with tempfile.TemporaryDirectory() as tmp:
+      path = Path(tmp) / "report.json"
+      subject._write_json(path, {"failure": failure})
+      serialized = path.read_text(encoding="utf-8")
+      reloaded = subject._read_json(path)
+    persisted = reloaded["failure"]["accounting_failure"]
+    self.assertEqual("PROVIDER_NORMALIZATION", persisted["failure_stage"])
+    self.assertEqual("LLMIncompleteResponseError",
+                     persisted["normalized_error_type"])
+    self.assertEqual(20, persisted["input_tokens"])
+    self.assertIsNone(persisted["output_tokens"])
+    for private_text in forbidden:
+      self.assertNotIn(private_text, serialized)
+
+    def fail_plan():
+      raise error
+
+    state = {"stage": "persona_move", "actor": "Ayesha Khan", "tick": 0}
+    with self.assertRaises(subject.ReplayCostAccountingUnavailableError) as caught:
+      with subject._observe_persona_move_failure(
+          SimpleNamespace(plan=fail_plan), state):
+        fail_plan()
+    self.assertIs(error, caught.exception)
+    combined = subject._build_failure_report(state, result, error)
+    self.assertEqual(failure["accounting_failure"], combined["accounting_failure"])
+    self.assertEqual({"stage": "PLAN", "function": "persona.plan"},
+                     combined["cognitive_failure"])
+    self.assertNotIn("cognitive_failure", failure)
+
+  def test_unrelated_failure_does_not_gain_accounting_diagnostic(self):
+    failure = subject._build_failure_report(
+      self._execution_state(), self._result(), RuntimeError("boom"))
+    self.assertNotIn("accounting_failure", failure)
+
+
+class PersonaMoveFailureDiagnosticTests(unittest.TestCase):
+  STAGES = ("PERCEIVE", "RETRIEVE", "PLAN", "REFLECT", "EXECUTE")
+  PRIVATE = (
+    "private prompt", "private response", "private memory",
+    "private retrieved text", "private plan", "private reflection",
+    "private dialogue", "private embedding vector", "sk-private-credential",
+    "private provider payload")
+
+  def _compare_move(self, failing_stage=None, previous_time=None, now=None):
+    # Execute the real, unmodified Persona.move and its public methods. Only
+    # module functions are deterministic fakes; no N25 model output is invented.
+    persona = persona_module.Persona.__new__(persona_module.Persona)
+    persona.name = "Synthetic Actor"
+    maze, perceived, retrieved, plan, execution = (object() for _ in range(5))
+    personas = {persona.name: persona}
+    now = now or datetime.datetime(2023, 2, 13)
+    tile = (2, 3)
+    error = type("Synthetic" + (failing_stage or "Success").title() + "Error",
+                 (RuntimeError,), {})(" ".join(self.PRIVATE))
+    calls = []
+
+    def record(stage, *args):
+      calls.append((stage, args))
+      persona.scratch.mutations.append(stage)
+      if stage == failing_stage:
+        raise error
+
+    def fake_perceive(actor, world):
+      record("PERCEIVE", actor, world)
+      return perceived
+
+    def fake_retrieve(actor, events):
+      record("RETRIEVE", actor, events)
+      return retrieved
+
+    def fake_plan(actor, world, registry, new_day, memories):
+      record("PLAN", actor, world, registry, new_day, memories)
+      return plan
+
+    def fake_reflect(actor):
+      record("REFLECT", actor)
+
+    def fake_execute(actor, world, registry, action):
+      record("EXECUTE", actor, world, registry, action)
+      return execution
+
+    expected_new_day = (
+      "First day" if previous_time is None else
+      "New day" if previous_time.date() != now.date() else False)
+    expected_calls = [
+      ("PERCEIVE", (persona, maze)),
+      ("RETRIEVE", (persona, perceived)),
+      ("PLAN", (persona, maze, personas, expected_new_day, retrieved)),
+      ("REFLECT", (persona,)),
+      ("EXECUTE", (persona, maze, personas, plan)),
+    ]
+    if failing_stage:
+      expected_calls = expected_calls[:self.STAGES.index(failing_stage) + 1]
+    states = []
+    with ExitStack() as stack:
+      for stage, function in zip(self.STAGES, (
+          fake_perceive, fake_retrieve, fake_plan, fake_reflect, fake_execute)):
+        stack.enter_context(patch.object(persona_module, stage.lower(), function))
+      for enabled in (False, True):
+        calls.clear()
+        persona.scratch = SimpleNamespace(
+          curr_time=previous_time, curr_tile=None, mutations=[])
+        before_keys = set(vars(persona))
+        state = {"stage": "persona_move", "actor": persona.name, "tick": 0}
+        try:
+          with subject._observe_persona_move_failure(persona, state, enabled=enabled):
+            value = persona.move(maze, personas, tile, now)
+        except Exception as caught:
+          self.assertIs(error, caught)
+          self.assertIs(type(error), type(caught))
+          self.assertIsNone(caught.__cause__)
+          self.assertIsNone(caught.__context__)
+          self.assertIsNotNone(caught.__traceback__)
+        else:
+          self.assertIsNone(failing_stage)
+          self.assertIs(execution, value)
+        self.assertEqual(expected_calls, calls)
+        self.assertEqual([stage for stage, _ in expected_calls],
+                         persona.scratch.mutations)
+        self.assertIs(now, persona.scratch.curr_time)
+        self.assertIs(tile, persona.scratch.curr_tile)
+        self.assertEqual(before_keys, set(vars(persona)))
+        states.append(state)
+    self.assertNotIn("cognitive_failure", states[0])
+    if failing_stage:
+      self.assertEqual({"stage": failing_stage,
+                        "function": "persona." + failing_stage.lower()},
+                       states[1]["cognitive_failure"])
+    else:
+      self.assertNotIn("cognitive_failure", states[1])
+
+  def test_perceive_failure_is_transparent(self):
+    self._compare_move("PERCEIVE")
+
+  def test_world_0555_with_null_scratch_is_first_day(self):
+    self._compare_move(now=datetime.datetime(2023, 2, 13, 5, 55, 0))
+
+  def test_retrieve_failure_is_transparent(self):
+    self._compare_move("RETRIEVE")
+
+  def test_plan_failure_is_transparent(self):
+    self._compare_move("PLAN")
+
+  def test_reflect_failure_is_transparent(self):
+    self._compare_move("REFLECT")
+
+  def test_execute_failure_is_transparent(self):
+    self._compare_move("EXECUTE")
+
+  def test_success_preserves_sequence_arguments_result_and_scratch(self):
+    for previous in (None, datetime.datetime(2023, 2, 12),
+                     datetime.datetime(2023, 2, 13)):
+      with self.subTest(previous=previous):
+        self._compare_move(previous_time=previous)
+
+  def test_scratch_failure_is_unknown_without_stale_previous_stage(self):
+    persona = persona_module.Persona.__new__(persona_module.Persona)
+    persona.scratch = SimpleNamespace(curr_time=object())
+    state = {"cognitive_failure": {"stage": "EXECUTE"}}
+    with self.assertRaises(AttributeError):
+      with subject._observe_persona_move_failure(persona, state):
+        persona.move(None, {}, (1, 2), datetime.datetime(2023, 2, 13))
+    self.assertEqual({"stage": "UNKNOWN", "function": None},
+                     state["cognitive_failure"])
+    with subject._observe_persona_move_failure(persona, state):
+      pass
+    self.assertNotIn("cognitive_failure", state)
+
+  def test_outer_public_stage_wins_over_nested_stage_and_chained_cause(self):
+    error = TypeError("'NoneType' object is not iterable")
+    cause = ValueError("private memory")
+
+    class NestedPersona:
+      def plan(self):
+        self.retrieve()
+
+      def retrieve(self):
+        raise error from cause
+
+    persona = NestedPersona()
+    state = {}
+    with self.assertRaises(TypeError) as caught:
+      with subject._observe_persona_move_failure(persona, state):
+        persona.plan()
+    self.assertIs(error, caught.exception)
+    self.assertIs(cause, caught.exception.__cause__)
+    self.assertEqual("PLAN", state["cognitive_failure"]["stage"])
+
+  def test_ambiguous_code_and_observer_lookup_errors_fail_unknown(self):
+    error = RuntimeError("private response")
+
+    def shared():
+      raise error
+
+    persona = SimpleNamespace(plan=shared, retrieve=shared)
+    for broken_lookup in (False, True):
+      with self.subTest(broken_lookup=broken_lookup), ExitStack() as stack:
+        if broken_lookup:
+          stack.enter_context(patch.object(subject, "_persona_cognitive_boundary",
+                                          side_effect=ValueError("lookup failed")))
+        state = {}
+        with self.assertRaises(RuntimeError) as caught:
+          with subject._observe_persona_move_failure(persona, state):
+            shared()
+        self.assertIs(error, caught.exception)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertEqual({"stage": "UNKNOWN", "function": None},
+                         state["cognitive_failure"])
+
+  def test_privacy_never_formats_objects_or_custom_exceptions(self):
+    class PrivateObject:
+      def __repr__(self):
+        raise AssertionError("repr must not run")
+
+    class PrivateError(RuntimeError):
+      def __str__(self):
+        raise AssertionError("str must not run")
+
+    for error in (PrivateError(PrivateObject()), TypeError(PrivateObject()),
+                  TypeError("'NoneType' object is not iterable " + " ".join(self.PRIVATE)),
+                  RuntimeError(" ".join(self.PRIVATE) * 100)):
+      message = subject._sanitized_cognitive_exception_message(error)
+      self.assertLessEqual(len(message), 128)
+      for private in self.PRIVATE:
+        self.assertNotIn(private, message)
+    self.assertEqual("'NoneType' object is not iterable",
+                     subject._sanitized_cognitive_exception_message(
+                       TypeError("'NoneType' object is not iterable")))
+
+  def test_launcher_serializes_each_stage_without_private_content(self):
+    # Real launcher/artifact path on the established three-actor fixture only.
+    cases = [(stage, False) for stage in self.STAGES] + [("REFLECT", True)]
+    for stage, observe_reflection in cases:
+      with self.subTest(stage=stage, reflection=observe_reflection), \
+          tempfile.TemporaryDirectory() as tmp:
+        error = type("Synthetic" + stage.title() + "Error", (RuntimeError,), {})(
+          " ".join(self.PRIVATE) * 100)
+
+        def fail(*args, **kwargs):
+          raise error
+
+        with patch.object(persona_module.Persona, stage.lower(), fail), \
+            patch.object(socket.socket, "connect",
+                         side_effect=AssertionError("network forbidden")):
+          result = subject.run_modern_smallville(
+            subject.ModernRunConfig(
+              run_name="synthetic-stage-" + stage.lower(),
+              observe_reflection_lifecycle=observe_reflection),
+            adapter=ModernTickFakeAdapter(), runtime_root=Path(tmp))
+        report_path = result.run_directory / "report.json"
+        report = subject._read_json(report_path)
+        failure = report["failure"]
+        self.assertEqual("MODERN_SMALLVILLE_HEADLESS_RUN_FAILED", result.verdict)
+        self.assertEqual(0, result.completed_ticks)
+        self.assertFalse(result.save_passed)
+        self.assertEqual("persona_move", failure["stage"])
+        self.assertEqual(subject.COGNITIVE_ACTOR, failure["actor"])
+        self.assertEqual(0, failure["tick"])
+        self.assertEqual(type(error).__name__, failure["exception_type"])
+        self.assertEqual({"stage": stage, "function": "persona." + stage.lower()},
+                         failure["cognitive_failure"])
+        self.assertIsNone(failure["caller"])
+        self.assertIsNone(failure["operation"])
+        self.assertNotIn("accounting_failure", failure)
+        self.assertEqual(result.exception_message, failure["exception_message"])
+        for path in (report_path, result.run_directory / "status.json"):
+          serialized = path.read_text(encoding="utf-8")
+          for private in self.PRIVATE:
+            self.assertNotIn(private, serialized)
+        self.assertEqual({"stage", "actor", "tick", "exception_type",
+                          "exception_message", "caller", "operation",
+                          "cognitive_failure"}, set(failure))
 
 
 class ReflectionLifecycleObserverTests(unittest.TestCase):
@@ -771,6 +1520,91 @@ class CausalSocialMemoryTests(unittest.TestCase):
     klaus["node_1"].object = "Maria Lopez"
     return {"Maria Lopez": maria, "Klaus Mueller": klaus}
 
+  @staticmethod
+  def _encounter_fixture(observer_scratch, target_scratch,
+                         observer_tile=(90, 74), target_tile=(91, 74),
+                         include_target_position=True):
+    perceived = [SimpleNamespace(
+      subject="John Lin", type="event", node_id="node_1")]
+    mei = SimpleNamespace(
+      name="Mei Lin", scratch=SimpleNamespace(curr_tile=observer_scratch),
+      a_mem=SimpleNamespace(
+        id_to_node={"node_1": perceived[0]},
+        get_last_chat=lambda target: False),
+      perceive=lambda maze: perceived)
+    john = SimpleNamespace(
+      name="John Lin", scratch=SimpleNamespace(curr_tile=target_scratch),
+      a_mem=SimpleNamespace(
+        id_to_node={}, get_last_chat=lambda target: False),
+      perceive=lambda maze: [])
+    personas_tile = {"Mei Lin": observer_tile}
+    if include_target_position:
+      personas_tile["John Lin"] = target_tile
+    server = SimpleNamespace(
+      personas={"Mei Lin": mei, "John Lin": john},
+      personas_tile=personas_tile)
+    arena_by_tile = {
+      tuple(observer_tile): "the Ville:Lin house:shared bedroom",
+      tuple(target_tile): "the Ville:Lin house:shared bedroom",
+    }
+    maze = SimpleNamespace(
+      get_tile_path=lambda tile, level: arena_by_tile[tuple(tile)])
+    return server, maze, perceived
+
+  @staticmethod
+  def _run_observed_perception(server, maze):
+    observer = subject._ConversationObserver(
+      server, {"tick": 0}, "simulation").install()
+    try:
+      returned = server.personas["Mei Lin"].perceive(maze)
+    finally:
+      observer.restore()
+    return observer, returned
+
+  def test_encounter_uses_authoritative_target_when_scratch_uninitialized(self):
+    server, maze, unused = self._encounter_fixture((90, 74), None)
+    observer, unused = self._run_observed_perception(server, maze)
+    self.assertEqual(1.0, observer.encounters[0]["distance"])
+
+  def test_encounter_uses_authoritative_positions_when_both_scratches_none(self):
+    server, maze, unused = self._encounter_fixture(
+      None, None, observer_tile=(2, 2), target_tile=(5, 6))
+    observer, unused = self._run_observed_perception(server, maze)
+    self.assertEqual(5.0, observer.encounters[0]["distance"])
+    self.assertTrue(observer.encounters[0]["same_arena"])
+
+  def test_encounter_ignores_stale_target_scratch_position(self):
+    server, maze, unused = self._encounter_fixture(
+      (2, 2), (100, 100), observer_tile=(2, 2), target_tile=(5, 6))
+    observer, unused = self._run_observed_perception(server, maze)
+    self.assertEqual(5.0, observer.encounters[0]["distance"])
+
+  def test_encounter_semantics_preserved_when_scratch_matches_world(self):
+    server, maze, unused = self._encounter_fixture(
+      (2, 2), (5, 6), observer_tile=(2, 2), target_tile=(5, 6))
+    observer, unused = self._run_observed_perception(server, maze)
+    self.assertEqual("Mei Lin", observer.encounters[0]["observer"])
+    self.assertEqual("John Lin", observer.encounters[0]["target"])
+    self.assertEqual(5.0, observer.encounters[0]["distance"])
+    self.assertTrue(observer.encounters[0]["same_arena"])
+
+  def test_encounter_observer_preserves_perception_result_identity(self):
+    server, maze, perceived = self._encounter_fixture(None, None)
+    unused, returned = self._run_observed_perception(server, maze)
+    self.assertIs(perceived, returned)
+    self.assertEqual(["node_1"], [node.node_id for node in returned])
+
+  def test_encounter_fails_explicitly_when_authoritative_target_is_missing(self):
+    server, maze, unused = self._encounter_fixture(
+      None, (91, 74), include_target_position=False)
+    observer = subject._ConversationObserver(
+      server, {"tick": 0}, "simulation").install()
+    try:
+      with self.assertRaisesRegex(KeyError, "John Lin"):
+        server.personas["Mei Lin"].perceive(maze)
+    finally:
+      observer.restore()
+
   def test_chat_to_event_lineage_is_content_free(self):
     snapshot = subject._social_memory_actor_snapshot(
       "Maria Lopez", self._nodes())
@@ -1041,6 +1875,56 @@ class ModernRunnerOfflineTests(unittest.TestCase):
     self.assertEqual([], network_calls)
     self.assertTrue((result.run_directory / "status.json").is_file())
     self.assertTrue((result.run_directory / "report.json").is_file())
+    self.assertIsNone(subject._read_json(
+      result.run_directory / "report.json")["failure"])
+
+  def test_actor_state_group_fails_closed_only_when_generated_plan_is_empty(self):
+    valid = subject.run_modern_smallville(
+      subject.ModernRunConfig(run_name="actor-state-valid"),
+      adapter=ModernTickFakeAdapter(), runtime_root=self.runtime_root)
+    self.assertEqual("MODERN_SMALLVILLE_HEADLESS_RUN_PASSED", valid.verdict)
+    valid_actor = subject._read_json(valid.run_directory / "report.json")[
+      "tick_progression"][0]["actors"][subject.COGNITIVE_ACTOR]
+    self.assertTrue(all((
+      valid_actor["node_ids_valid"], valid_actor["node_ids_unique"],
+      valid_actor["embedding_references_valid"],
+      valid_actor["orphan_embedding_count"] == 0,
+      valid_actor["daily_plan_present"], valid_actor["schedule_length"] > 0,
+      valid_actor["current_action_present"],
+      valid_actor["current_action_actor_aligned"])))
+
+    original = subject._actor_tick_metadata
+
+    def without_generated_plan(persona, coordinate):
+      generated_plan = persona.scratch.daily_req
+      persona.scratch.daily_req = []
+      try:
+        current = original(persona, coordinate)
+      finally:
+        persona.scratch.daily_req = generated_plan
+      self.assertTrue(all((
+        current["node_ids_valid"], current["node_ids_unique"],
+        current["embedding_references_valid"],
+        current["orphan_embedding_count"] == 0,
+        current["schedule_length"] > 0, current["current_action_present"],
+        current["current_action_actor_aligned"])))
+      self.assertFalse(current["daily_plan_present"])
+      return current
+
+    with patch.object(subject, "_actor_tick_metadata",
+                      side_effect=without_generated_plan):
+      invalid = subject.run_modern_smallville(
+        subject.ModernRunConfig(run_name="actor-state-invalid"),
+        adapter=ModernTickFakeAdapter(), runtime_root=self.runtime_root)
+    self.assertEqual("MODERN_SMALLVILLE_HEADLESS_RUN_FAILED", invalid.verdict)
+    self.assertEqual(subject.ModernRuntimeInvariantError.__name__,
+                     invalid.exception_type)
+    self.assertEqual(
+      "actor state invariant failed: actor=Isabella Rodriguez, tick=0",
+      invalid.exception_message)
+    self.assertEqual(0, invalid.completed_ticks)
+    self.assertFalse((invalid.run_directory / "fixture" / "storage" /
+                      "actor-state-invalid" / "environment" / "1.json").exists())
 
   def test_existing_run_directory_fails_closed(self):
     existing = self.runtime_root / "collision"
@@ -1329,6 +2213,9 @@ class ModernRunnerOfflineTests(unittest.TestCase):
     source_result = self._create_persisted_run()
     source_report = subject._read_json(
       source_result.run_directory / "report.json")
+    # Historical R1CLI reports predate the explicit registry mode field.
+    source_report["config"].pop("actor_registry")
+    subject._write_json(source_result.run_directory / "report.json", source_report)
     source_simulation = Path(source_report["artifacts"]["simulation"])
     old_movement_hashes = {
       f"{index}.json": subject._file_sha256(

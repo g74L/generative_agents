@@ -466,14 +466,30 @@ def inspect_isolated_embedding_store(persona_name, store_path,
   )
 
 
+def validate_persona_registry(persona_names):
+  """Return an ordered registry of unique, safe Persona directory names."""
+  if (not isinstance(persona_names, (list, tuple)) or not persona_names
+      or any(not isinstance(name, str) or not name.strip()
+             or name != name.strip() or name in (".", "..")
+             or name.endswith(".")
+             or any(char in name for char in '/\\:<>"|?*')
+             or any(ord(char) < 32 for char in name)
+             for name in persona_names)
+      or len(set(persona_names)) != len(persona_names)):
+    raise ValueError("Persona registry must contain unique, valid names")
+  return tuple(persona_names)
+
+
 def prepare_isolated_embedding_stores(fixture,
                                       persona_names=ISOLATED_FIXTURE_PERSONAS):
   """Audit all required stores, then modernize only proven-empty copies."""
   if not isinstance(fixture, IsolatedReverieFixture):
     raise TypeError("fixture must be IsolatedReverieFixture")
-  if tuple(persona_names) != ISOLATED_FIXTURE_PERSONAS:
+  try:
+    persona_names = validate_persona_registry(persona_names)
+  except ValueError as error:
     raise IsolatedEmbeddingPreflightError(
-      "PERSONA_SET_MISMATCH", "required Persona set does not match")
+      "PERSONA_SET_MISMATCH", "required Persona registry is invalid") from error
 
   audits_before = tuple(inspect_isolated_embedding_store(
     persona_name,

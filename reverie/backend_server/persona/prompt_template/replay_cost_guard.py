@@ -14,6 +14,8 @@ from threading import RLock
 from typing import Optional, Tuple
 
 from persona.prompt_template.cost_ledger import (
+  COMPLETE,
+  PRICING_COMPLETE,
   CostLedgerContext,
   CostLedgerRecord,
   PricingSnapshot,
@@ -32,6 +34,22 @@ from persona.prompt_template.llm_provider import (
 
 
 COVERED_OPERATIONS = frozenset((CHAT, COMPLETION_COMPAT, EMBEDDING))
+ACCOUNTING_DIAGNOSTIC_SCHEMA_VERSION = 1
+PROVIDER_ATTEMPT = "PROVIDER_ATTEMPT"
+PROVIDER_NORMALIZATION = "PROVIDER_NORMALIZATION"
+TELEMETRY_EVENT = "TELEMETRY_EVENT"
+USAGE_VALIDATION = "USAGE_VALIDATION"
+PRICING_RESOLUTION = "PRICING_RESOLUTION"
+LEDGER_RECORD_BUILD = "LEDGER_RECORD_BUILD"
+GUARD_ACCOUNTING = "GUARD_ACCOUNTING"
+
+_NORMALIZATION_ERROR_TYPES = frozenset((
+  "LLMEmptyOutputError",
+  "LLMIncompleteResponseError",
+  "LLMMalformedResponseError",
+  "LLMRefusalError",
+  "ModernChatResponseValidationError",
+))
 
 
 def _event_bound_cost_context(event: TelemetryEvent) -> CostLedgerContext:
@@ -42,6 +60,135 @@ def _event_bound_cost_context(event: TelemetryEvent) -> CostLedgerContext:
     actor_id=event.actor_id,
     simulation_id=event.simulation_id,
     simulation_step=event.simulation_step,
+  )
+
+
+@dataclass(frozen=True)
+class AccountingFailureDiagnostic:
+  """Content-free evidence for one fail-closed accounting decision."""
+
+  schema_version: int
+  operation: str
+  model: str
+  response_model: Optional[str]
+  caller_id: Optional[str]
+  cognitive_category: Optional[str]
+  actor_id: Optional[str]
+  simulation_id: Optional[str]
+  simulation_step: Optional[int]
+  logical_call_id: Optional[str]
+  physical_attempt: Optional[int]
+  provider_outcome: str
+  provider_error_type: Optional[str]
+  normalized_result_type: Optional[str]
+  normalized_error_type: Optional[str]
+  request_id: Optional[str]
+  finish_reason: Optional[str]
+  response_status: Optional[str]
+  usage_present: bool
+  usage_shape: str
+  input_tokens: Optional[int]
+  output_tokens: Optional[int]
+  cached_input_tokens: Optional[int]
+  reasoning_tokens: Optional[int]
+  usage_validation_category: str
+  pricing_status: str
+  failure_stage: str
+  original_exception_type: Optional[str]
+  sanitized_exception_message: str
+  guard_classification: str
+  guard_action: str
+
+
+def _usage_shape(event: TelemetryEvent, record=None) -> str:
+  values = (
+    event.input_tokens, event.output_tokens,
+    event.cached_input_tokens, event.reasoning_tokens)
+  if all(value is None for value in values):
+    return "ABSENT"
+  if record is not None:
+    return "COMPLETE" if record.token_usage_status == COMPLETE else "PARTIAL"
+  required = ((event.input_tokens,) if event.operation == EMBEDDING else
+              (event.input_tokens, event.output_tokens))
+  if (not _event_usage_is_malformed(event)
+      and all(type(value) is int and value >= 0 for value in required)):
+    return "COMPLETE"
+  return "PARTIAL"
+
+
+def _event_usage_is_malformed(event: TelemetryEvent) -> bool:
+  values = (
+    event.input_tokens, event.output_tokens,
+    event.cached_input_tokens, event.reasoning_tokens)
+  if any(value is not None and (type(value) is not int or value < 0)
+         for value in values):
+    return True
+  return bool(
+    event.cached_input_tokens is not None
+    and event.input_tokens is not None
+    and event.cached_input_tokens > event.input_tokens)
+
+
+def _event_failure_stage(event: TelemetryEvent, record) -> str:
+  if record.token_usage_status != COMPLETE:
+    if _event_usage_is_malformed(event):
+      return TELEMETRY_EVENT
+    if event.outcome == "ERROR":
+      if event.error_type in _NORMALIZATION_ERROR_TYPES:
+        return PROVIDER_NORMALIZATION
+      return PROVIDER_ATTEMPT
+    return USAGE_VALIDATION
+  if record.pricing_status != PRICING_COMPLETE:
+    return PRICING_RESOLUTION
+  return GUARD_ACCOUNTING
+
+
+def _event_diagnostic(event: TelemetryEvent, *, failure_stage: str,
+                      record=None, original_error=None,
+                      sanitized_message: str) -> AccountingFailureDiagnostic:
+  normalization_error = (
+    event.error_type if event.error_type in _NORMALIZATION_ERROR_TYPES else None)
+  provider_error = (
+    event.error_type if event.outcome == "ERROR"
+    and normalization_error is None else None)
+  return AccountingFailureDiagnostic(
+    schema_version=ACCOUNTING_DIAGNOSTIC_SCHEMA_VERSION,
+    operation=event.operation,
+    model=event.model_or_engine,
+    response_model=event.response_model,
+    caller_id=event.caller_id,
+    cognitive_category=event.cognitive_category,
+    actor_id=event.actor_id,
+    simulation_id=event.simulation_id,
+    simulation_step=event.simulation_step,
+    logical_call_id=event.logical_call_id,
+    physical_attempt=event.physical_attempt,
+    provider_outcome=event.outcome,
+    provider_error_type=provider_error,
+    normalized_result_type=(
+      "NORMALIZED_RESULT" if event.outcome == "SUCCESS" else None),
+    normalized_error_type=normalization_error,
+    request_id=event.request_id,
+    finish_reason=event.finish_reason,
+    response_status=event.response_status,
+    usage_present=any(value is not None for value in (
+      event.input_tokens, event.output_tokens,
+      event.cached_input_tokens, event.reasoning_tokens)),
+    usage_shape=_usage_shape(event, record),
+    input_tokens=event.input_tokens,
+    output_tokens=event.output_tokens,
+    cached_input_tokens=event.cached_input_tokens,
+    reasoning_tokens=event.reasoning_tokens,
+    usage_validation_category=(
+      record.token_usage_status if record is not None else "NOT_EVALUATED"),
+    pricing_status=(
+      record.pricing_status if record is not None else "NOT_EVALUATED"),
+    failure_stage=failure_stage,
+    original_exception_type=(
+      type(original_error).__name__[:128] if original_error is not None else None),
+    sanitized_exception_message=sanitized_message,
+    guard_classification="ACCOUNTING_UNAVAILABLE",
+    guard_action="TRIPPED_AND_RAISED",
   )
 
 
@@ -61,9 +208,10 @@ class ReplayCostCeilingExceededError(ReplayCostGuardError):
 
 
 class ReplayCostAccountingUnavailableError(ReplayCostGuardError):
-  def __init__(self, operation, model):
+  def __init__(self, operation, model, diagnostic=None):
     self.operation = operation
     self.model = model
+    self.diagnostic = diagnostic
     super().__init__(
       f"Replay cost accounting unavailable for {operation} using {model}")
 
@@ -139,6 +287,7 @@ class ReplayCostGuardState:
       raise TypeError("config must be ReplayCostGuardConfig")
     self.config = config
     self._records = []
+    self._accounting_failure_diagnostic = None
     self._tripped = False
     self._in_flight = None
     self._lock = RLock()
@@ -161,7 +310,30 @@ class ReplayCostGuardState:
           accumulated, self.config.ceiling.maximum_cost)
       if operation not in COVERED_OPERATIONS:
         self._tripped = True
-        raise ReplayCostAccountingUnavailableError(operation, model)
+        diagnostic = AccountingFailureDiagnostic(
+          schema_version=ACCOUNTING_DIAGNOSTIC_SCHEMA_VERSION,
+          operation=operation, model=model, response_model=None,
+          caller_id=replay_context.caller_id,
+          cognitive_category=replay_context.cognitive_category,
+          actor_id=replay_context.actor_id,
+          simulation_id=replay_context.simulation_id,
+          simulation_step=replay_context.simulation_step,
+          logical_call_id=logical_call_id, physical_attempt=physical_attempt,
+          provider_outcome="NOT_RUN", provider_error_type=None,
+          normalized_result_type=None, normalized_error_type=None,
+          request_id=None, finish_reason=None, response_status=None,
+          usage_present=False, usage_shape="ABSENT",
+          input_tokens=None, output_tokens=None, cached_input_tokens=None,
+          reasoning_tokens=None, usage_validation_category="NOT_EVALUATED",
+          pricing_status="NOT_EVALUATED", failure_stage=GUARD_ACCOUNTING,
+          original_exception_type=None,
+          sanitized_exception_message=(
+            "operation is not covered by replay cost accounting"),
+          guard_classification="ACCOUNTING_UNAVAILABLE",
+          guard_action="TRIPPED_AND_RAISED")
+        self._accounting_failure_diagnostic = diagnostic
+        raise ReplayCostAccountingUnavailableError(
+          operation, model, diagnostic)
       if replay_context.simulation_id != self.config.simulation_id:
         self._tripped = True
         raise ReplayCostContextMismatchError()
@@ -178,13 +350,23 @@ class ReplayCostGuardState:
             context_resolver=_event_bound_cost_context)[0]
         except Exception as error:
           self._tripped = True
+          diagnostic = _event_diagnostic(
+            event, failure_stage=LEDGER_RECORD_BUILD,
+            original_error=error,
+            sanitized_message="ledger record construction raised")
+          self._accounting_failure_diagnostic = diagnostic
           raise ReplayCostAccountingUnavailableError(
-            event.operation, event.model_or_engine) from error
+            event.operation, event.model_or_engine, diagnostic) from error
         self._records.append(record)
         if record.estimated_total_cost_usd is None:
           self._tripped = True
+          diagnostic = _event_diagnostic(
+            event, failure_stage=_event_failure_stage(event, record),
+            record=record,
+            sanitized_message="estimated total cost is unavailable")
+          self._accounting_failure_diagnostic = diagnostic
           raise ReplayCostAccountingUnavailableError(
-            event.operation, event.model_or_engine)
+            event.operation, event.model_or_engine, diagnostic)
         accumulated = self._accumulated_cost()
         maximum = self.config.ceiling.maximum_cost
         if accumulated >= maximum:
@@ -222,6 +404,11 @@ class ReplayCostGuardState:
   def records(self) -> Tuple[CostLedgerRecord, ...]:
     with self._lock:
       return tuple(self._records)
+
+  def accounting_failure_diagnostic(
+      self) -> Optional[AccountingFailureDiagnostic]:
+    with self._lock:
+      return self._accounting_failure_diagnostic
 
 
 @dataclass(frozen=True)

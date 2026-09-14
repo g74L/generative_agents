@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import shutil
 import sys
+from types import FunctionType, MethodType
 from typing import Any, Optional
 
 
@@ -46,6 +47,8 @@ from persona.prompt_template.modern_openai_provider import (
   LLMIncompleteResponseError, ModernOpenAIClientAdapter,
 )
 from persona.prompt_template.replay_cost_guard import (
+  AccountingFailureDiagnostic,
+  ReplayCostAccountingUnavailableError,
   ReplayCostCeiling, ReplayCostCeilingExceededError,
   ReplayCostGuardAlreadyTrippedError, ReplayCostGuardConfig,
   use_replay_cost_guard,
@@ -185,6 +188,8 @@ class ModernRunConfig:
   cost_ceiling_usd: Decimal = DEFAULT_COST_CEILING
   controlled_proximity: bool = False
   observe_reflection_lifecycle: bool = False
+  actor_registry: str = "default"
+  start_time: Optional[dt.datetime] = None
 
   def __post_init__(self):
     if type(self.ticks) is not int or self.ticks <= 0:
@@ -214,9 +219,32 @@ class ModernRunConfig:
         or len(set(self.passive_actors)) != len(self.passive_actors)):
       raise ModernRunConfigurationError(
         "passive actors must be a tuple of unique names")
-    if self.visible_actors != VISIBLE_ACTORS:
+    if self.actor_registry not in ("default", "source"):
+      raise ModernRunConfigurationError("actor registry mode is invalid")
+    if self.start_time is not None:
+      if (type(self.start_time) is not dt.datetime
+          or self.start_time.tzinfo is not None):
+        raise ModernRunConfigurationError(
+          "start time must be a timezone-free datetime")
+      if self.actor_registry != "source":
+        raise ModernRunConfigurationError(
+          "start time requires the source actor registry")
+      if self.controlled_proximity:
+        raise ModernRunConfigurationError(
+          "start time is incompatible with controlled proximity")
+    try:
+      controlled_replay.validate_persona_registry(self.visible_actors)
+    except ValueError as error:
+      raise ModernRunConfigurationError(str(error)) from error
+    if not isinstance(self.visible_actors, tuple):
+      raise ModernRunConfigurationError("visible actors must be a tuple")
+    if self.actor_registry == "default" and self.visible_actors != VISIBLE_ACTORS:
       raise ModernRunConfigurationError(
         "modern Smallville requires Isabella, Maria and Klaus as visible actors")
+    if self.actor_registry == "source" and (
+        self.cognitive_actors != self.visible_actors or self.passive_actors):
+      raise ModernRunConfigurationError(
+        "source registry requires all source actors cognitive and none passive")
     cognitive = set(self.cognitive_actors)
     passive = set(self.passive_actors)
     visible = set(self.visible_actors)
@@ -243,6 +271,9 @@ class ModernRunConfig:
       raise ModernRunConfigurationError(
         "controlled_proximity must be a boolean")
     if self.controlled_proximity:
+      if self.actor_registry != "default":
+        raise ModernRunConfigurationError(
+          "R1M3-C requires the default three-actor registry")
       if self.cognitive_actors != VISIBLE_ACTORS or self.passive_actors:
         raise ModernRunConfigurationError(
           "R1M3-C requires three cognitive actors and no passive actors")
@@ -294,6 +325,8 @@ class _ResumeContext:
   source_meta: dict[str, Any]
   cognitive_actors: tuple[str, ...]
   passive_actors: tuple[str, ...]
+  visible_actors: tuple[str, ...]
+  actor_registry: str
   movement_hashes: dict[str, str]
   environment_hashes: dict[str, str]
   actor_state: dict[str, dict[str, Any]]
@@ -349,6 +382,60 @@ def _normalize(value):
   return value
 
 
+def _persona_cognitive_boundary(persona, error):
+  """Identify the outermost public stage using code identity, never locals.
+
+  Read the active methods at failure time so existing launcher observers are
+  recognized too. Shared/opaque callables cannot prove a stage: fail UNKNOWN.
+  No traceback, frame, callable, argument or semantic content is retained.
+  """
+  boundaries = {}
+  for name in ("perceive", "retrieve", "plan", "reflect", "execute"):
+    method = getattr(persona, name, None)
+    function = method.__func__ if isinstance(method, MethodType) else method
+    if isinstance(function, FunctionType):
+      boundaries.setdefault(id(function.__code__), []).append(name)
+  trace = error.__traceback__
+  while trace is not None:
+    names = boundaries.get(id(trace.tb_frame.f_code), ())
+    if names:
+      if len(names) == 1:
+        return {"stage": names[0].upper(), "function": "persona." + names[0]}
+      break
+    trace = trace.tb_next
+  return {"stage": "UNKNOWN", "function": None}
+
+
+@contextmanager
+def _observe_persona_move_failure(persona, execution_state, *, enabled=True):
+  """Observe only escaping move failures; re-raise the original exception."""
+  if not enabled:
+    yield
+    return
+  execution_state.pop("cognitive_failure", None)
+  try:
+    yield
+  except Exception as error:
+    boundary = {"stage": "UNKNOWN", "function": None}
+    try:
+      boundary = _persona_cognitive_boundary(persona, error)
+    except Exception:
+      # A diagnostic lookup failure must never replace the original failure.
+      pass
+    execution_state["cognitive_failure"] = boundary
+    raise
+
+
+def _sanitized_cognitive_exception_message(error):
+  """Allow only fixed structural text; never invoke user __str__ or repr."""
+  if type(error) is TypeError:
+    args = BaseException.args.__get__(error)
+    if (len(args) == 1 and type(args[0]) is str
+        and args[0] == "'NoneType' object is not iterable"):
+      return "'NoneType' object is not iterable"
+  return "[redacted: non-allowlisted exception message]"
+
+
 def _build_failure_report(
     execution_state: dict, result: ModernRunResult,
     error: Optional[BaseException]) -> Optional[dict]:
@@ -362,7 +449,7 @@ def _build_failure_report(
   """
   if error is None:
     return None
-  return {
+  failure = {
     "stage": execution_state["stage"],
     "actor": execution_state["actor"],
     "tick": execution_state["tick"],
@@ -371,6 +458,13 @@ def _build_failure_report(
     "caller": getattr(error, "caller", None),
     "operation": getattr(error, "operation", None),
   }
+  diagnostic = getattr(error, "diagnostic", None)
+  if isinstance(diagnostic, AccountingFailureDiagnostic):
+    failure["accounting_failure"] = asdict(diagnostic)
+  if "cognitive_failure" in execution_state:
+    failure["cognitive_failure"] = dict(execution_state["cognitive_failure"])
+    failure["exception_message"] = _sanitized_cognitive_exception_message(error)
+  return failure
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -880,6 +974,23 @@ def _bootstrap_isolated_temporal_source(
     _write_json(scratch_path, scratch)
 
 
+def _override_isolated_source_start_time(
+    source: Path, start_time: dt.datetime) -> dict[str, Any]:
+  """Set only the initial world clock in a caller-owned source copy."""
+  meta_path = source / "reverie" / "meta.json"
+  meta = _read_json(meta_path)
+  if meta.get("step") != 0:
+    raise ModernRunConfigurationError(
+      "start time requires a source simulation at step zero")
+  meta["curr_time"] = start_time.strftime(DATE_FORMAT)
+  _write_json(meta_path, meta)
+  return {
+    "requested_start_time": start_time,
+    "effective_start_time": meta["curr_time"],
+    "step": meta["step"],
+  }
+
+
 def _bootstrap_controlled_proximity_source(source: Path) -> dict[str, Any]:
   """Create the daytime R1M3-C opportunity in an already isolated copy."""
   meta_path = source / "reverie" / "meta.json"
@@ -1136,7 +1247,7 @@ def _actor_state_metadata(persona):
     "node_ids_unique": len(node_ids) == len(set(node_ids)),
     "embedding_references_valid": references.issubset(embedding_keys),
     "orphan_embedding_count": len(embedding_keys - references),
-    "daily_plan_present": bool(persona.scratch.daily_plan_req),
+    "daily_plan_present": bool(persona.scratch.daily_req),
     "schedule_present": bool(persona.scratch.f_daily_schedule),
     "current_action_present": bool(
       persona.scratch.act_description and persona.scratch.act_address
@@ -1478,8 +1589,8 @@ class _ConversationObserver:
         for node in perceived:
           target = node.subject
           if target in self.server.personas and target != _name:
-            target_tile = tuple(self.server.personas[target].scratch.curr_tile)
-            observer_tile = tuple(_persona.scratch.curr_tile)
+            observer_tile = tuple(self.server.personas_tile[_name])
+            target_tile = tuple(self.server.personas_tile[target])
             self.encounters.append({
               "tick": self.execution_state["tick"], "observer": _name,
               "target": target,
@@ -1750,6 +1861,33 @@ def _indexed_history_hashes(root: Path, first: int, stop: int):
   return {name: _file_sha256(root / name) for name in expected}
 
 
+def load_source_actor_registry(source: Path, meta=None) -> tuple[str, ...]:
+  """Validate the source authority before copying or initializing providers."""
+  try:
+    meta = _read_json(source / "reverie" / "meta.json") if meta is None else meta
+    names = meta.get("persona_names")
+    if not isinstance(names, list):
+      raise ValueError("source persona_names must be a non-empty list")
+    registry = controlled_replay.validate_persona_registry(names)
+    step = meta.get("step")
+    if type(step) is not int or step < 0:
+      raise ValueError("source simulation step is invalid")
+    environment = _read_json(source / "environment" / f"{step}.json")
+    if not isinstance(environment, dict):
+      raise ValueError("source environment must be an actor mapping")
+    for name in registry:
+      persona = source / "personas" / name
+      if (not persona.is_dir()
+          or persona.resolve().parent != (source / "personas").resolve()):
+        raise ValueError(f"source Persona directory is missing or invalid: {name}")
+      if name not in environment:
+        raise ValueError(f"source environment actor is missing: {name}")
+    return registry
+  except (OSError, ValueError, TypeError, AttributeError) as error:
+    raise ModernRunConfigurationError(
+      f"source actor registry is invalid: {error}") from error
+
+
 def _prepare_resume_context(
     config: ModernResumeConfig, root: Path) -> _ResumeContext:
   source_run = config.source_run.resolve()
@@ -1781,12 +1919,11 @@ def _prepare_resume_context(
       "resume source does not contain a validated persisted run")
   cognitive_actors = tuple(actor_policy.get("cognitive", ()))
   passive_actors = tuple(actor_policy.get("passive", ()))
-  if (tuple(actor_policy.get("visible", ())) != VISIBLE_ACTORS
-      or not cognitive_actors
-      or set(cognitive_actors) | set(passive_actors) != set(VISIBLE_ACTORS)
-      or set(cognitive_actors) & set(passive_actors)):
-    raise ModernRunConfigurationError(
-      "resume source actor registry is incompatible")
+  visible_actors = tuple(actor_policy.get("visible", ()))
+  actor_registry = source_config.get("actor_registry", "default")
+  ModernRunConfig(
+    cognitive_actors=cognitive_actors, passive_actors=passive_actors,
+    visible_actors=visible_actors, actor_registry=actor_registry)
 
   simulation_root = source_run / "fixture" / "storage" / source_run.name
   if not simulation_root.is_dir():
@@ -1807,7 +1944,7 @@ def _prepare_resume_context(
   if meta.get("sec_per_step") != 10:
     raise ModernRunConfigurationError(
       "resume source tick duration is incompatible")
-  if tuple(meta.get("persona_names", ())) != VISIBLE_ACTORS:
+  if load_source_actor_registry(simulation_root, meta) != visible_actors:
     raise ModernRunConfigurationError(
       "resume source actor registry is incompatible")
   if (source_result.get("final_step") != step
@@ -1838,7 +1975,7 @@ def _prepare_resume_context(
       "resume source cognitive state is inconsistent: "
       + repr(actor_state_issues))
   embedding_audits = tuple(_embedding_audits(
-    simulation_root, VISIBLE_ACTORS).values())
+    simulation_root, visible_actors).values())
   if any(not all((
       audit.classification == controlled_replay.MODERN_COMPATIBLE,
       audit.manifest_present,
@@ -1859,6 +1996,7 @@ def _prepare_resume_context(
     request=config, source_run=source_run,
     simulation_root=simulation_root, source_meta=meta,
     cognitive_actors=cognitive_actors, passive_actors=passive_actors,
+    visible_actors=visible_actors, actor_registry=actor_registry,
     movement_hashes=movement_hashes,
     environment_hashes=environment_hashes, actor_state=actor_state,
     embedding_audits=embedding_audits,
@@ -1888,6 +2026,8 @@ def run_modern_smallville_resume(
     run_name=config.run_name, ticks=config.ticks, tick_seconds=10,
     cognitive_actors=resume.cognitive_actors,
     passive_actors=resume.passive_actors,
+    visible_actors=resume.visible_actors,
+    actor_registry=resume.actor_registry,
     cost_ceiling_usd=config.cost_ceiling_usd,
     controlled_proximity=False)
   return _execute_modern_smallville(
@@ -1911,12 +2051,8 @@ def _execute_modern_smallville(
     raise ModernRunConfigurationError("source simulation step is invalid")
   if source_meta.get("sec_per_step") != config.tick_seconds:
     raise ModernRunConfigurationError("source tick duration is incompatible")
-  if tuple(source_meta.get("persona_names", ())) != VISIBLE_ACTORS:
+  if load_source_actor_registry(source, source_meta) != config.visible_actors:
     raise ModernRunConfigurationError("source actor registry is incompatible")
-  adapter = adapter or _default_adapter()
-  live = isinstance(adapter, ModernOpenAIClientAdapter)
-  providers = controlled_replay.ControlledReplayProviders(
-    adapter, adapter, adapter, live_api_enabled=live)
   root.mkdir(parents=True, exist_ok=True)
   run_dir = root / config.run_name
   try:
@@ -1939,25 +2075,35 @@ def _execute_modern_smallville(
   if resume is None:
     if config.controlled_proximity:
       fixture_seed = _bootstrap_controlled_proximity_source(isolated_source)
-    else:
+    elif config.actor_registry == "default":
       _bootstrap_isolated_temporal_source(
         isolated_source, config.cognitive_actors)
+    elif config.start_time is not None:
+      fixture_seed = _override_isolated_source_start_time(
+        isolated_source, config.start_time)
   meta = _read_json(isolated_source / "reverie" / "meta.json")
   source_step = meta.get("step")
   if type(source_step) is not int or source_step < 0:
     raise ModernRunConfigurationError("source simulation step is invalid")
   if meta.get("sec_per_step") != config.tick_seconds:
     raise ModernRunConfigurationError("source tick duration is incompatible")
-  if tuple(meta.get("persona_names", ())) != VISIBLE_ACTORS:
+  if load_source_actor_registry(isolated_source, meta) != config.visible_actors:
     raise ModernRunConfigurationError("source actor registry is incompatible")
+  if source_hash_before != _tree_sha256(source):
+    raise ModernRuntimeInvariantError(
+      "source simulation changed during preparation")
+  adapter = adapter or _default_adapter()
+  live = isinstance(adapter, ModernOpenAIClientAdapter)
+  providers = controlled_replay.ControlledReplayProviders(
+    adapter, adapter, adapter, live_api_enabled=live)
   fixture = controlled_replay.prepare_isolated_reverie_fixture(
     isolated_source, fixture_root, source, source_step)
   if resume is None:
     embedding_preflight = controlled_replay.prepare_isolated_embedding_stores(
-      fixture)
+      fixture, config.visible_actors)
   else:
     copied_audits = tuple(_embedding_audits(
-      isolated_source, VISIBLE_ACTORS).values())
+      isolated_source, config.visible_actors).values())
     if any(audit.classification != controlled_replay.MODERN_COMPATIBLE
            for audit in copied_audits):
       raise ModernRunConfigurationError(
@@ -2054,7 +2200,7 @@ def _execute_modern_smallville(
         server = reverie_module.ReverieServer(source_code, simulation_code)
         hydration_provider_calls = (
           len(get_telemetry()) - calls_before_hydration)
-        if set(server.personas) != set(VISIBLE_ACTORS):
+        if tuple(server.personas) != config.visible_actors:
           raise ModernRuntimeInvariantError("visible actor registry changed")
         initial_step, initial_time = server.step, server.curr_time
         if config.controlled_proximity:
@@ -2063,10 +2209,10 @@ def _execute_modern_smallville(
         server_identity = id(server)
         maze_identity = id(server.maze)
         persona_identities = {
-          name: id(server.personas[name]) for name in VISIBLE_ACTORS}
+          name: id(server.personas[name]) for name in config.visible_actors}
         expected_actor_order = tuple(server.personas)
         continuity["sequential_actor_order"] = (
-          expected_actor_order == VISIBLE_ACTORS)
+          expected_actor_order == config.visible_actors)
         actor_state_before = {
           name: _actor_state_metadata(server.personas[name])
           for name in config.cognitive_actors}
@@ -2116,7 +2262,8 @@ def _execute_modern_smallville(
         for name, persona in server.personas.items():
           original = persona.move
 
-          def counted_move(*args, _name=name, _original=original, **kwargs):
+          def counted_move(*args, _name=name, _original=original,
+                           _persona=persona, **kwargs):
             actor_move_counts[_name] += 1
             if _name not in config.cognitive_actors:
               return _original(*args, **kwargs)
@@ -2131,7 +2278,8 @@ def _execute_modern_smallville(
               actor_id=_name, cognitive_category="WORLD_TICK")
             with (use_llm_replay_context(context),
                   use_cost_ledger_context(ledger)):
-              return _original(*args, **kwargs)
+              with _observe_persona_move_failure(_persona, execution_state):
+                return _original(*args, **kwargs)
 
           persona.move = counted_move
         reflection_lifecycle_enabled = (
@@ -2156,6 +2304,8 @@ def _execute_modern_smallville(
           previous_tick_state = actor_state_before
           for tick in range(config.ticks):
             step_before, time_before = server.step, server.curr_time
+            if tuple(server.personas) != config.visible_actors:
+              raise ModernRuntimeInvariantError("visible actor registry changed")
             if id(server) != server_identity:
               raise ModernRuntimeInvariantError(
                 "ReverieServer instance changed between ticks")
@@ -2163,23 +2313,28 @@ def _execute_modern_smallville(
               raise ModernRuntimeInvariantError(
                 "Maze instance changed between ticks")
             if any(id(server.personas[name]) != persona_identities[name]
-                   for name in VISIBLE_ACTORS):
+                   for name in config.visible_actors):
               raise ModernRuntimeInvariantError(
                 "Persona instance changed between ticks")
             execution_state.update(
               stage="world_tick", actor=None, tick=server.step)
             server.start_server(1)
+            if tuple(server.personas) != config.visible_actors:
+              raise ModernRuntimeInvariantError("visible actor registry changed")
             execution_state.update(
               stage="movement_validation", actor=None, tick=step_before)
             movement_path = saved_root / "movement" / f"{initial_step + tick}.json"
             movement = _read_json(movement_path)
-            if set(movement.get("persona", {})) != set(VISIBLE_ACTORS):
+            if set(movement.get("persona", {})) != set(config.visible_actors):
               raise ModernRuntimeInvariantError(
                 "movement frame does not contain all visible actors")
             environment = _read_json(
               saved_root / "environment" / f"{initial_step + tick}.json")
+            if not set(config.visible_actors).issubset(environment):
+              raise ModernRuntimeInvariantError(
+                "environment frame does not contain all visible actors")
             tick_actors = {}
-            for name in VISIBLE_ACTORS:
+            for name in config.visible_actors:
               actor_frame = movement["persona"][name]
               coordinate = actor_frame.get("movement")
               if not isinstance(coordinate, list) or len(coordinate) != 2:
@@ -2264,7 +2419,7 @@ def _execute_modern_smallville(
           "same_maze_across_ticks": id(server.maze) == maze_identity,
           "same_personas_across_ticks": all(
             id(server.personas[name]) == persona_identities[name]
-            for name in VISIBLE_ACTORS),
+            for name in config.visible_actors),
           "sequential_actor_order": all(
             tuple(name for name, step in actor_move_sequence if step == tick)
             == config.cognitive_actors
@@ -2415,7 +2570,7 @@ def _execute_modern_smallville(
           calls_before_reload == calls_after_reload,
           reloaded.step == server.step,
           reloaded.curr_time == server.curr_time,
-          len(reloaded.personas) == len(VISIBLE_ACTORS),
+          tuple(reloaded.personas) == config.visible_actors,
           memory_preserved, state_preserved, embeddings_valid, isolation_valid,
           all(continuity.values()), movement_integrity_valid,
           expected_total_frames
@@ -2758,9 +2913,9 @@ def _execute_modern_smallville(
                  isolation_valid, actor_structures_valid,
                  continuity_valid, tick_progression_valid,
                  movement_integrity_valid, telemetry_attribution_valid,
-                 resume is None or (
-                   resume_hydration.get("all_checks_passed", False)
-                   and source_hash_before == _tree_sha256(source))))
+                 source_hash_before == _tree_sha256(source),
+                 resume is None or resume_hydration.get(
+                   "all_checks_passed", False)))
   reflection_report["verdict"] = _reflection_lifecycle_verdict(
     reflection_report, run_error=error, run_success=success)
   r1m3b_policy = (
@@ -2830,12 +2985,15 @@ def _execute_modern_smallville(
     total_cost_usd=total_cost, cost_ceiling_usd=config.cost_ceiling_usd,
     save_passed=save_passed, reload_passed=reload_passed,
     actor_move_counts=tuple((name, actor_move_counts[name])
-                            for name in VISIBLE_ACTORS),
+                            for name in config.visible_actors),
     passive_provider_calls=passive_provider_calls,
     passive_memory_mutations=passive_mutations,
     legacy_fallback_count=legacy_count, retry_count=retry_count,
     exception_type=type(error).__name__ if error else None,
-    exception_message=str(error)[:512] if error else None,
+    exception_message=(
+      _sanitized_cognitive_exception_message(error)
+      if "cognitive_failure" in execution_state else str(error)[:512]
+    ) if error else None,
   )
   report = {
     "result": asdict(result),
@@ -2993,6 +3151,16 @@ def _positive_int(value: str) -> int:
   return result
 
 
+def _start_time_argument(value: str) -> dt.datetime:
+  if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", value):
+    raise argparse.ArgumentTypeError(
+      "must use the timezone-free format YYYY-MM-DDTHH:MM:SS")
+  try:
+    return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S")
+  except ValueError as error:
+    raise argparse.ArgumentTypeError("must be a valid local datetime") from error
+
+
 def build_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(prog="modern_smallville")
   commands = parser.add_subparsers(dest="command", required=True)
@@ -3003,8 +3171,16 @@ def build_parser() -> argparse.ArgumentParser:
                    default=DEFAULT_COST_CEILING)
   run.add_argument("--source", default=DEFAULT_SOURCE)
   run.add_argument(
-    "--cognitive", choices=("isabella", "all"), default="isabella",
-    help="run cognition for Isabella only or for all visible actors")
+    "--start-time", type=_start_time_argument,
+    help="initial source-registry world clock (YYYY-MM-DDTHH:MM:SS)")
+  actor_policy = run.add_mutually_exclusive_group()
+  actor_policy.add_argument(
+    "--cognitive", choices=("isabella", "all"),
+    help="run cognition for Isabella only (default) or all three visible actors")
+  actor_policy.add_argument(
+    "--actor-registry", choices=("default", "source"), default="default",
+    help="source: preserve the fixture registry and native initial state; "
+         "all source actors are cognitive, none passive")
   run.add_argument(
     "--controlled-proximity", action="store_true",
     help="use the isolated daytime R1M3-C encounter fixture")
@@ -3037,7 +3213,7 @@ def _render(result: ModernRunResult) -> str:
   passive_lines = (tuple(f"  {name}" for name in result.passive_actors)
                    or ("  (none)",))
   move_summary = ", ".join(
-    f"{name.split()[0]}={moves.get(name, 0)}" for name in VISIBLE_ACTORS)
+    f"{name.split()[0]}={moves.get(name, 0)}" for name in moves)
   return "\n".join((
     result.verdict,
     "",
@@ -3077,10 +3253,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         observe_reflection_lifecycle=args.observe_reflection_lifecycle)
       result = run_modern_smallville_resume(config)
     else:
-      cognitive_actors = (
-        VISIBLE_ACTORS if args.cognitive == "all" else (COGNITIVE_ACTOR,))
+      visible_actors = (
+        load_source_actor_registry(SOURCE_ROOT / args.source)
+        if args.actor_registry == "source" else VISIBLE_ACTORS)
+      cognitive_actors = (visible_actors
+        if args.actor_registry == "source" or args.cognitive == "all"
+        else (COGNITIVE_ACTOR,))
       passive_actors = tuple(
-        name for name in VISIBLE_ACTORS if name not in cognitive_actors)
+        name for name in visible_actors if name not in cognitive_actors)
       config = ModernRunConfig(
         source_simulation=args.source,
         run_name=args.name or generate_run_name(),
@@ -3088,6 +3268,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         cost_ceiling_usd=args.cost_ceiling,
         cognitive_actors=cognitive_actors,
         passive_actors=passive_actors,
+        visible_actors=visible_actors,
+        actor_registry=args.actor_registry,
+        start_time=args.start_time,
         controlled_proximity=args.controlled_proximity,
         observe_reflection_lifecycle=args.observe_reflection_lifecycle,
       )

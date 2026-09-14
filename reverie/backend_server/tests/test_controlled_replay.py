@@ -379,6 +379,50 @@ class IsolatedEmbeddingPreflightTests(unittest.TestCase):
     return inspect_isolated_embedding_store(
       persona_name, self.store(persona_name), self.isolated)
 
+  def test_explicit_registry_preserves_order_and_includes_extra_persona(self):
+    names = ("Extra Persona",) + tuple(reversed(self.PERSONAS))
+    self.store(names[0]).mkdir(parents=True)
+    self.write_store(self.store(names[0]))
+    result = prepare_isolated_embedding_stores(self.fixture, names)
+    self.assertEqual(names, result.bootstrapped_personas)
+    self.assertEqual(names, tuple(a.persona_name for a in result.audits_after))
+    self.assertTrue(all(a.classification == MODERN_COMPATIBLE
+                        for a in result.audits_after))
+    self.assertFalse((self.baseline / "personas" / names[0]).exists())
+
+  def test_invalid_explicit_registry_fails_before_bootstrap(self):
+    for names in ((), ("",), ("  ",), (None,), ([],),
+                  ("../outside",), ("a/b",), ("a\\b",), ("a:b",),
+                  ("Isabella Rodriguez", "Isabella Rodriguez")):
+      with self.subTest(names=names), self.assertRaises(
+          IsolatedEmbeddingPreflightError):
+        prepare_isolated_embedding_stores(self.fixture, names)
+    self.assertFalse((self.store(self.PERSONAS[0])
+                      / EMBEDDING_MANIFEST_FILENAME).exists())
+
+  def test_extra_blocked_actor_prevents_all_bootstrap(self):
+    name = "Extra Persona"
+    self.store(name).mkdir(parents=True)
+    names = self.PERSONAS + (name,)
+    for classification in (LEGACY_NONEMPTY_BLOCKED, INCONSISTENT_BLOCKED,
+                           UNKNOWN_BLOCKED):
+      with self.subTest(classification=classification):
+        if classification == LEGACY_NONEMPTY_BLOCKED:
+          self.write_store(self.store(name), {"key": [1.0] + [0.0] * 1535},
+                           {"node_1": self.node()})
+        elif classification == INCONSISTENT_BLOCKED:
+          self.write_store(self.store(name), {}, {"node_1": self.node()})
+        else:
+          self.write_store(self.store(name))
+          (self.store(name) / "kw_strength.json").unlink()
+        with self.assertRaises(IsolatedEmbeddingPreflightError) as caught:
+          prepare_isolated_embedding_stores(self.fixture, names)
+        self.assertEqual(names, tuple(a.persona_name
+                                     for a in caught.exception.audits))
+        self.assertEqual(classification, caught.exception.audits[-1].classification)
+        self.assertFalse((self.store(self.PERSONAS[0])
+                          / EMBEDDING_MANIFEST_FILENAME).exists())
+
   def test_01_empty_legacy_store_is_bootstrappable_with_structural_metadata(self):
     audit = self.audit()
 
