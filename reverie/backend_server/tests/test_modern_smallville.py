@@ -2111,7 +2111,7 @@ class ModernRunnerOfflineTests(unittest.TestCase):
       call["model"] == "gpt-4o-mini" for call in adapter.calls
       if call["method"] == "create_chat"))
 
-  def test_all_continue_dialogue_stops_at_historical_safety_ceiling(self):
+  def test_all_continue_dialogue_is_incomplete_and_not_committed(self):
     config = subject.ModernRunConfig(
       run_name="offline-r1m3c-ceiling", ticks=2,
       cognitive_actors=subject.VISIBLE_ACTORS, passive_actors=(),
@@ -2121,17 +2121,24 @@ class ModernRunnerOfflineTests(unittest.TestCase):
       runtime_root=self.runtime_root)
     report = subject._read_json(result.run_directory / "report.json")
     gate = report["interaction"]["conversation_gate"]
-    conversation = gate["conversations"][0]
-    self.assertEqual(subject.R1M3C_FUNCTIONAL_VERDICT, result.verdict)
-    self.assertTrue(gate["committed"])
-    self.assertTrue(gate["social_pipeline_functional"])
+    memory = report["interaction"]["bilateral_memory"]
+    failure = report["failure"]
+    self.assertEqual("R1M3_C_MODERN_CALLER_BLOCKED", result.verdict)
+    self.assertEqual("ConversationIncompleteError", result.exception_type)
+    self.assertFalse(gate["started"])
+    self.assertFalse(gate["committed"])
+    self.assertFalse(gate["valid"])
+    self.assertFalse(gate["social_pipeline_functional"])
     self.assertFalse(gate["model_end_observed"])
-    self.assertTrue(gate["safety_ceiling_reached"])
-    self.assertEqual(16, conversation["turn_count"])
-    self.assertEqual("SAFETY_CEILING", conversation["termination"])
+    self.assertFalse(gate["safety_ceiling_reached"])
+    self.assertEqual([], gate["conversations"])
+    self.assertFalse(memory["saved"])
+    self.assertFalse(memory["reloaded"])
+    self.assertEqual("ConversationIncompleteError", failure["exception_type"])
+    self.assertEqual("persona_move", failure["stage"])
     self.assertEqual(
-      ["Maria Lopez", "Klaus Mueller"] * 8,
-      conversation["speaker_sequence"])
+      {"function": "persona.plan", "stage": "PLAN"},
+      failure["cognitive_failure"])
 
   def test_model_end_with_persistent_memory_is_natural_complete(self):
     self.assertEqual(

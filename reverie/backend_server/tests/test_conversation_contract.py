@@ -111,6 +111,12 @@ class ConversationContractTests(unittest.TestCase):
     self.assertEqual(2, len(adapter.calls))
     self.assertEqual(before, self.snapshot())
 
+  def test_model_end_is_normally_consumable(self):
+    result = contract.ConversationResult(
+      ((SAM, 'A valid completed turn.'),), Termination.MODEL_END)
+    self.assertIs(result, result.require_complete())
+    self.assertEqual(list(result.transcript), list(result))
+
   def test_safety_ceiling_preserves_sixteen_valid_alternating_turns(self):
     result, adapter = self.execute([REL, UTT] * 16, 'conversation')
     self.assertEqual(Termination.SAFETY_CEILING, result.termination)
@@ -118,6 +124,20 @@ class ConversationContractTests(unittest.TestCase):
     self.assertEqual(16, result.turn_count)
     self.assertEqual([SAM, TOM] * 8, [row[0] for row in result.transcript])
     self.assertEqual(32, len(adapter.calls))
+
+  def test_safety_ceiling_is_incomplete_but_diagnostically_available(self):
+    transcript = ((SAM, 'A valid but unfinished turn.'),)
+    result = contract.ConversationResult(transcript, Termination.SAFETY_CEILING)
+    self.assertEqual(transcript, result.transcript)
+    self.assertIsNone(result.failure)
+    for consume in (result.require_complete, lambda: list(result)):
+      with self.subTest(consume=consume):
+        with self.assertRaises(contract.ConversationIncompleteError) as raised:
+          consume()
+        self.assertIs(result, raised.exception.result)
+        self.assertEqual(Termination.SAFETY_CEILING,
+                         raised.exception.termination)
+        self.assertEqual(1, raised.exception.turn_count)
 
   def test_alternation_stops_on_target_model_end(self):
     result, adapter = self.execute([REL, UTT, REL, END], 'conversation')
@@ -330,6 +350,37 @@ class ConversationContractTests(unittest.TestCase):
       self.assertEqual((), raised.exception.result.transcript)
       for guard in guards:
         guard.assert_not_called()
+
+  def test_safety_ceiling_bridge_blocks_completed_conversation_consumers(self):
+    with ExitStack() as stack:
+      guards = [stack.enter_context(patch.object(plan, name,
+        side_effect=AssertionError('completed consequence forbidden')))
+        for name in ('_chat_react', '_create_react',
+                     'generate_new_decomp_schedule', 'generate_convo_summary')]
+      with self.assertRaises(contract.ConversationIncompleteError) as raised:
+        self.execute([REL, UTT] * 16, 'bridge')
+      self.assertEqual(Termination.SAFETY_CEILING,
+                       raised.exception.termination)
+      self.assertEqual(16, raised.exception.turn_count)
+      self.assertEqual(16, len(raised.exception.result.transcript))
+      for guard in guards:
+        guard.assert_not_called()
+
+  def test_failure_remains_cognitive_failure_with_diagnostic_transcript(self):
+    transcript = ((SAM, 'A prior valid turn.'),)
+    failure = contract.ConversationFailure(
+      'utterance', TOM, SAM, Status.TIMEOUT, 1, 'LLMTimeoutError')
+    result = contract.ConversationResult(
+      transcript, Termination.FAILURE, failure)
+    self.assertEqual(transcript, result.transcript)
+    for consume in (result.require_complete, lambda: list(result)):
+      with self.subTest(consume=consume):
+        with self.assertRaises(
+            contract.ConversationCognitionUnavailableError) as raised:
+          consume()
+        self.assertIs(result, raised.exception.result)
+        self.assertEqual(Status.TIMEOUT, raised.exception.status)
+        self.assertEqual('utterance', raised.exception.surface)
 
   def test_non_success_cannot_carry_speech_relationship_or_end(self):
     for status in Status:

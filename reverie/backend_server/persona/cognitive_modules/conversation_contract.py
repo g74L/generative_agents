@@ -140,7 +140,7 @@ class ConversationResult:
       if not isinstance(self.failure, ConversationFailure):
         raise ValueError('failed conversation requires structural cause')
     elif self.failure is not None or not self.transcript:
-      raise ValueError('completed conversation requires speech and no failure')
+      raise ValueError('non-failure conversation requires speech and no failure')
 
   @property
   def turn_count(self):
@@ -149,14 +149,16 @@ class ConversationResult:
   def require_complete(self):
     if self.termination == ConversationTermination.FAILURE:
       raise ConversationCognitionUnavailableError(self)
+    if self.termination == ConversationTermination.SAFETY_CEILING:
+      raise ConversationIncompleteError(self)
     return self
 
   def __iter__(self):
     """Read-only success view for the existing generate_convo/summary bridge.
 
-    The bridge retains this typed object, including termination. Failure never
-    becomes an iterable partial conversation for legacy consequence consumers.
-    Explicit .transcript remains available for inspecting failed diagnostics.
+    The bridge retains this typed object, including termination. Only MODEL_END
+    becomes iterable for legacy consequence consumers. Explicit .transcript
+    remains available for inspecting incomplete and failed diagnostics.
     """
     self.require_complete()
     return iter(self.transcript)
@@ -168,6 +170,15 @@ class ConversationCognitionUnavailableError(RuntimeError):
     self.status = result.failure.status
     self.surface = result.failure.surface
     super().__init__(f'conversation: {self.surface}: {self.status.value}')
+
+
+class ConversationIncompleteError(RuntimeError):
+  """Valid bounded cognition that lacks explicit semantic completion."""
+  def __init__(self, result):
+    self.result = result
+    self.termination = result.termination
+    self.turn_count = result.turn_count
+    super().__init__(f'conversation: {self.termination.value}: incomplete')
 
 
 def _memories(retrieved, attribute):
