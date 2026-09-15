@@ -25,6 +25,9 @@ from persona.cognitive_modules.social_talk_decision import (
   consume_social_talk_result,
   decide_social_talk,
 )
+from persona.cognitive_modules.social_consequence import (
+  commit_social_conversation_experience,
+)
 
 ##############################################################################
 # CHAPTER 2: Generate
@@ -813,7 +816,8 @@ def _create_react(persona, inserted_act, inserted_act_dur,
                   act_address, act_event, chatting_with, chat, chatting_with_buffer,
                   chatting_end_time, 
                   act_pronunciatio, act_obj_description, act_obj_pronunciatio, 
-                  act_obj_event, act_start_time=None): 
+                  act_obj_event, act_start_time=None,
+                  chat_experience_id=None):
   p = persona 
 
   min_sum = 0
@@ -860,7 +864,8 @@ def _create_react(persona, inserted_act, inserted_act_dur,
                            act_obj_description,
                            act_obj_pronunciatio,
                            act_obj_event,
-                           act_start_time)
+                           act_start_time,
+                           chat_experience_id)
 
 
 def _chat_react(maze, persona, focused_event, reaction_mode, personas):
@@ -872,6 +877,9 @@ def _chat_react(maze, persona, focused_event, reaction_mode, personas):
 
   # Actually creating the conversation here. 
   convo, duration_min = generate_convo(maze, init_persona, target_persona)
+  social_commit = commit_social_conversation_experience(
+    convo, init_persona, target_persona,
+    started_at=init_persona.scratch.curr_time)
   convo_summary = generate_convo_summary(init_persona, convo)
   inserted_act = convo_summary
   inserted_act_dur = duration_min
@@ -908,7 +916,7 @@ def _chat_react(maze, persona, focused_event, reaction_mode, personas):
     _create_react(p, inserted_act, inserted_act_dur,
       act_address, act_event, chatting_with, actor_chat, chatting_with_buffer, chatting_end_time,
       act_pronunciatio, act_obj_description, act_obj_pronunciatio, 
-      act_obj_event, act_start_time)
+      act_obj_event, act_start_time, social_commit.experience.experience_id)
 
 
 def _wait_react(persona, reaction_mode): 
@@ -1003,6 +1011,7 @@ def plan(persona, maze, personas, new_day, retrieved):
     persona.scratch.chatting_with = None
     persona.scratch.chat = None
     persona.scratch.chatting_end_time = None
+    persona.scratch.chat_experience_id = None
   # We want to make sure that the persona does not keep conversing with each
   # other in an infinite loop. So, chatting_with_buffer maintains a form of 
   # buffer that makes the persona wait from talking to the same target 

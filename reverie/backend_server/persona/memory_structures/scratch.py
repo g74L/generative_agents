@@ -146,6 +146,9 @@ class Scratch:
     # e.g., ["Dolores Murphy"] = self.vision_r
     self.chatting_with_buffer = dict()
     self.chatting_end_time = None
+    # Stable identity for a directly committed OCE conversation. None keeps
+    # historical Chat actions on the legacy perception-time memory path.
+    self.chat_experience_id = None
 
     # <path_set> is True if we've already calculated the path the persona will
     # take to execute this action. That path is stored in the persona's 
@@ -223,6 +226,7 @@ class Scratch:
       self.chatting_with = scratch_load["chatting_with"]
       self.chat = scratch_load["chat"]
       self.chatting_with_buffer = scratch_load["chatting_with_buffer"]
+      self.chat_experience_id = scratch_load.get("chat_experience_id")
       if scratch_load["chatting_end_time"]: 
         self.chatting_end_time = datetime.datetime.strptime(
                                             scratch_load["chatting_end_time"],
@@ -303,6 +307,7 @@ class Scratch:
     scratch["chatting_with"] = self.chatting_with
     scratch["chat"] = self.chat
     scratch["chatting_with_buffer"] = self.chatting_with_buffer
+    scratch["chat_experience_id"] = self.chat_experience_id
     if self.chatting_end_time: 
       scratch["chatting_end_time"] = (self.chatting_end_time
                                         .strftime("%B %d, %Y, %H:%M:%S"))
@@ -500,7 +505,8 @@ class Scratch:
                      act_obj_description, 
                      act_obj_pronunciatio, 
                      act_obj_event, 
-                     act_start_time=None): 
+                     act_start_time=None,
+                     chat_experience_id=None):
     self.act_address = action_address
     self.act_duration = action_duration
     self.act_description = action_description
@@ -512,6 +518,7 @@ class Scratch:
     if chatting_with_buffer: 
       self.chatting_with_buffer.update(chatting_with_buffer)
     self.chatting_end_time = chatting_end_time
+    self.chat_experience_id = chat_experience_id
 
     self.act_obj_description = act_obj_description
     self.act_obj_pronunciatio = act_obj_pronunciatio

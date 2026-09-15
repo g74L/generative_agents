@@ -130,7 +130,7 @@ RESUME_SCRATCH_FIELDS = (
   "act_address", "act_start_time", "act_duration", "act_description",
   "act_event", "act_obj_description", "act_obj_pronunciatio",
   "act_obj_event", "chatting_with", "chat", "chatting_with_buffer",
-  "chatting_end_time", "act_path_set", "planned_path",
+  "chatting_end_time", "chat_experience_id", "act_path_set", "planned_path",
   "importance_trigger_max", "importance_trigger_curr", "importance_ele_n",
   "thought_count", "name", "first_name", "last_name", "age", "innate",
   "learned", "currently", "lifestyle", "living_area",

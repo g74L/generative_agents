@@ -2105,8 +2105,10 @@ class ModernRunnerOfflineTests(unittest.TestCase):
     self.assertTrue({
       "decide_to_talk", "agent_chat_summarize_relationship",
       "iterative_chat_utterance", "summarize_conversation",
-      "chat_poignancy",
     }.issubset(chat_callers))
+    # Direct OCE Chat consequences are factual and explicitly uninterpreted;
+    # this boundary must not manufacture an actor-specific salience judgment.
+    self.assertNotIn("chat_poignancy", chat_callers)
     self.assertTrue(all(
       call["model"] == "gpt-4o-mini" for call in adapter.calls
       if call["method"] == "create_chat"))

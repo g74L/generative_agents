@@ -129,12 +129,14 @@ class ScratchPersistenceContractTests(unittest.TestCase):
     saved = json.loads(output.read_text(encoding="utf-8"))
     reloaded = Scratch(str(output))
 
-    self.assertEqual(original, saved)
+    expected = dict(original, chat_experience_id=None)
+    self.assertEqual(expected, saved)
     self.assertIsNone(saved["curr_time"])
     self.assertIsNone(saved["act_start_time"])
     self.assertIsNone(reloaded.curr_time)
     self.assertIsNone(reloaded.act_start_time)
-    self.assertEqual(set(original), set(saved))
+    self.assertEqual(set(expected), set(saved))
+    self.assertIsNone(reloaded.chat_experience_id)
 
   def test_03_null_action_start_does_not_erase_loaded_current_time(self):
     serialized = "February 13, 2023, 00:00:00"
@@ -152,7 +154,9 @@ class ScratchPersistenceContractTests(unittest.TestCase):
     self.assertIsNone(scratch.act_start_time)
     self.assertEqual(expected, reloaded.curr_time)
     self.assertIsNone(reloaded.act_start_time)
-    self.assertEqual(original, json.loads(output.read_text(encoding="utf-8")))
+    self.assertEqual(
+      dict(original, chat_experience_id=None),
+      json.loads(output.read_text(encoding="utf-8")))
 
   def test_04_datetime_fields_keep_the_historical_json_format(self):
     curr_time = "February 13, 2023, 00:00:10"
@@ -165,7 +169,7 @@ class ScratchPersistenceContractTests(unittest.TestCase):
     Scratch(str(source)).save(str(output))
     saved = json.loads(output.read_text(encoding="utf-8"))
 
-    self.assertEqual(original, saved)
+    self.assertEqual(dict(original, chat_experience_id=None), saved)
     self.assertEqual(curr_time, saved["curr_time"])
     self.assertEqual(act_start_time, saved["act_start_time"])
     self.assertEqual(datetime.datetime.strptime(curr_time, DATETIME_FORMAT),
@@ -192,7 +196,7 @@ class ScratchPersistenceContractTests(unittest.TestCase):
     persona.save(str(persona_root / "bootstrap_memory"))
 
     saved = json.loads(scratch_path.read_text(encoding="utf-8"))
-    self.assertEqual(original, saved)
+    self.assertEqual(dict(original, chat_experience_id=None), saved)
     self.assertIsNone(saved["curr_time"])
     self.assertIsNone(saved["act_start_time"])
 
@@ -213,6 +217,24 @@ class ScratchPersistenceContractTests(unittest.TestCase):
       {"persistence_order_marker": {}},
       json.loads((memory / "spatial_memory.json").read_text(encoding="utf-8")))
     self.assertEqual(scratch_before, scratch_path.read_bytes())
+
+  def test_08_chat_experience_bridge_round_trips_and_default_action_resets(self):
+    marker = "oce.social_conversation_experience.v1:abc123"
+    source, _ = self.copy_scratch(changes={
+      "chat_experience_id": marker,
+    })
+    output = self.root / "saved.json"
+
+    scratch = Scratch(str(source))
+    self.assertEqual(marker, scratch.chat_experience_id)
+    scratch.save(str(output))
+    reloaded = Scratch(str(output))
+    self.assertEqual(marker, reloaded.chat_experience_id)
+
+    reloaded.add_new_action(
+      "address", 1, "ordinary action", "", (reloaded.name, "is", "busy"),
+      None, None, None, None, None, None, (None, None, None))
+    self.assertIsNone(reloaded.chat_experience_id)
 
 
 class IntegratedScratchPersistenceTests(unittest.TestCase):

@@ -12,6 +12,9 @@ from global_methods import *
 from persona.prompt_template.gpt_structure import *
 from persona.prompt_template.run_gpt_prompt import *
 from persona.prompt_template.llm_provider import PERCEPTION, embedding_call_context
+from persona.cognitive_modules.social_consequence import (
+  require_scratch_experience_chat,
+)
 
 def generate_poig_score(persona, event_type, description): 
   if "is idle" in description: 
@@ -155,22 +158,28 @@ def perceive(persona, maze):
       # of the persona here. 
       chat_node_ids = []
       if p_event[0] == f"{persona.name}" and p_event[1] == "chat with": 
-        curr_event = persona.scratch.act_event
-        if persona.scratch.act_description in persona.a_mem.embeddings: 
-          chat_embedding = persona.a_mem.embeddings[
-                             persona.scratch.act_description]
-        else: 
-          chat_embedding = get_embedding(persona.scratch
-                                                .act_description)
-        chat_embedding_pair = (persona.scratch.act_description, 
-                               chat_embedding)
-        chat_poignancy = generate_poig_score(persona, "chat", 
-                                             persona.scratch.act_description)
-        chat_node = persona.a_mem.add_chat(persona.scratch.curr_time, None,
-                      curr_event[0], curr_event[1], curr_event[2], 
-                      persona.scratch.act_description, keywords, 
-                      chat_poignancy, chat_embedding_pair, 
-                      persona.scratch.chat)
+        experience_id = getattr(persona.scratch, "chat_experience_id", None)
+        if experience_id is not None:
+          chat_node = require_scratch_experience_chat(
+            persona.a_mem, experience_id, persona.name, p_event[2],
+            persona.scratch.chat)
+        else:
+          curr_event = persona.scratch.act_event
+          if persona.scratch.act_description in persona.a_mem.embeddings:
+            chat_embedding = persona.a_mem.embeddings[
+                               persona.scratch.act_description]
+          else:
+            chat_embedding = get_embedding(persona.scratch
+                                                  .act_description)
+          chat_embedding_pair = (persona.scratch.act_description,
+                                 chat_embedding)
+          chat_poignancy = generate_poig_score(persona, "chat",
+                                               persona.scratch.act_description)
+          chat_node = persona.a_mem.add_chat(persona.scratch.curr_time, None,
+                        curr_event[0], curr_event[1], curr_event[2],
+                        persona.scratch.act_description, keywords,
+                        chat_poignancy, chat_embedding_pair,
+                        persona.scratch.chat)
         chat_node_ids = [chat_node.node_id]
 
       # Finally, we add the current event to the agent's memory. 
