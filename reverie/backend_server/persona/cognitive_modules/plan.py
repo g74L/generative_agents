@@ -285,11 +285,10 @@ def generate_act_obj_event_triple(act_game_object, act_obj_desc, persona):
 
 
 def generate_convo(maze, init_persona, target_persona): 
-  curr_loc = maze.access_tile(init_persona.scratch.curr_tile)
-
-  # convo = run_gpt_prompt_create_conversation(init_persona, target_persona, curr_loc)[0]
-  # convo = agent_chat_v1(maze, init_persona, target_persona)
+  # Keep the typed result as the first return value; never expose a failed
+  # partial transcript to legacy summary/schedule consumers. No effects here.
   convo = agent_chat_v2(maze, init_persona, target_persona)
+  convo.require_complete()
   all_utt = ""
 
   for row in convo: 

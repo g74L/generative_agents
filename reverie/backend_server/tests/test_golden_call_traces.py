@@ -393,32 +393,35 @@ class GoldenCallTraceTests(unittest.TestCase):
     maze = SimpleNamespace(access_tile=lambda tile: {
       "sector": "home", "arena": "kitchen"})
     self.fake.queue_embedding_response([1.0, 0.0])
-    self.fake.queue_chat_response('{"output": "Alice trusts Bob"}')
     self.fake.queue_embedding_response([1.0, 0.0])
     self.fake.queue_embedding_response([1.0, 0.0])
-    self.fake.queue_chat_response(
+    adapter = _ModernChatAdapter(
+      '{"relationship": "Alice trusts Bob"}',
       '{"utterance": "Hello Bob", "end": true}')
 
-    with redirect_stdout(io.StringIO()):
+    with redirect_stdout(io.StringIO()), use_modern_chat_runtime(
+        build_modern_chat_runtime_config(), adapter):
       chat = converse.agent_chat_v2(maze, init_persona, target_persona)
 
-    self.assertEqual([["Alice", "Hello Bob"]], chat)
-    trace = self.trace()
+    self.assertEqual((("Alice", "Hello Bob"),), chat.transcript)
+    self.assertEqual("MODEL_END", chat.termination.value)
+    self.assertIsNone(chat.failure)
+    trace = build_golden_trace(get_telemetry())
     self.assertEqual(
       [EMBEDDING, CHAT, EMBEDDING, EMBEDDING, CHAT],
       [item["operation"] for item in trace])
     self.assertEqual(
-      ["text-embedding-ada-002", "gpt-3.5-turbo",
+      ["text-embedding-ada-002", M5_CHAT_MODEL,
        "text-embedding-ada-002", "text-embedding-ada-002",
-       "gpt-3.5-turbo"],
+       M5_CHAT_MODEL],
       [item["model"] for item in trace])
     self.assertEqual([1, 1, 1, 1, 1],
                      [item["physical_attempts"] for item in trace])
     self.assertEqual(["Bob"], self.fake.calls[0].arguments["input"])
     self.assertEqual(["Alice trusts Bob"],
-                     self.fake.calls[2].arguments["input"])
+                     self.fake.calls[1].arguments["input"])
     self.assertEqual(["Bob is making tea"],
-                     self.fake.calls[3].arguments["input"])
+                     self.fake.calls[2].arguments["input"])
     self.assertEqual(init_persona.scratch.curr_time,
                      init_node.last_accessed)
     self.assertNotIn("Alice trusts Bob", repr(trace))

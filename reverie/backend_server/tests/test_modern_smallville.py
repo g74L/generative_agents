@@ -56,7 +56,7 @@ class NaturalConversationFakeAdapter(ModernTickFakeAdapter):
     if caller_id == "decide_to_talk":
       return '{"decision":"yes"}'
     if caller_id == "agent_chat_summarize_relationship":
-      return '{"output": "context"}'
+      return '{"relationship": "context"}'
     if caller_id == "iterative_chat_utterance":
       self.turn += 1
       end = "true" if self.turn == 2 else "false"

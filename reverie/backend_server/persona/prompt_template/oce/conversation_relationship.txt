@@ -1,0 +1,8 @@
+Interpret {speaker}'s relationship with {target} using only these memories from
+{speaker}'s own perspective:
+{memories}
+
+Do not assume access to the other person's private identity or thoughts. If the
+memories provide little knowledge, express that uncertainty in the interpretation.
+Return only a JSON object with exactly one key, "relationship", whose value is
+non-empty text. Do not add Markdown, extra keys or text outside the JSON object.

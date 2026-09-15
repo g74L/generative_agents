@@ -17,6 +17,13 @@ from persona.memory_structures.associative_memory import *
 from persona.memory_structures.scratch import *
 from persona.cognitive_modules.retrieve import *
 from persona.prompt_template.run_gpt_prompt import *
+from persona.cognitive_modules.conversation_contract import (
+  ConversationFailure, ConversationResult, ConversationStatus,
+  ConversationTermination, MAX_CONVERSATION_ROUNDS,
+  build_relationship_request, build_utterance_request,
+  interpret_relationship, generate_utterance, provider_failure,
+  LLMProviderError, ModernChatRuntimeError,
+)
 from persona.prompt_template.llm_provider import (
   CONVERSATION,
   MEMORY_WRITE,
@@ -44,7 +51,7 @@ def generate_agent_chat_summarize_ideas(init_persona,
   return summarized_idea
 
 
-def generate_summarize_agent_relationship(init_persona, 
+def generate_legacy_summarize_agent_relationship(init_persona,
                                           target_persona, 
                                           retrieved): 
   all_embedding_keys = list()
@@ -95,7 +102,7 @@ def agent_chat_v1(maze, init_persona, target_persona):
   for p_1, p_2 in part_pairs: 
     focal_points = [f"{p_2.scratch.name}"]
     retrieved = new_retrieve(p_1, focal_points, 50)
-    relationship = generate_summarize_agent_relationship(p_1, p_2, retrieved)
+    relationship = generate_legacy_summarize_agent_relationship(p_1, p_2, retrieved)
     focal_points = [f"{relationship}", 
                     f"{p_2.scratch.name} is {p_2.scratch.act_description}"]
     retrieved = new_retrieve(p_1, focal_points, 25)
@@ -108,81 +115,63 @@ def agent_chat_v1(maze, init_persona, target_persona):
                       summarized_ideas[1])
 
 
-def generate_one_utterance(maze, init_persona, target_persona, retrieved, curr_chat): 
-  # Chat version optimized for speed via batch generation
-  curr_context = (f"{init_persona.scratch.name} " + 
-              f"was {init_persona.scratch.act_description} " + 
-              f"when {init_persona.scratch.name} " + 
-              f"saw {target_persona.scratch.name} " + 
-              f"in the middle of {target_persona.scratch.act_description}.\n")
-  curr_context += (f"{init_persona.scratch.name} " +
-              f"is initiating a conversation with " +
-              f"{target_persona.scratch.name}.")
+def generate_summarize_agent_relationship(init_persona, target_persona, retrieved):
+  return interpret_relationship(build_relationship_request(
+    init_persona, target_persona, retrieved))
 
-  print ("July 23 5")
-  x = run_gpt_generate_iterative_chat_utt(maze, init_persona, target_persona, retrieved, curr_context, curr_chat)[0]
 
-  print ("July 23 6")
+def generate_one_utterance(maze, init_persona, target_persona, retrieved,
+                           curr_chat, relationship):
+  return generate_utterance(build_utterance_request(
+    maze, init_persona, target_persona, retrieved, curr_chat, relationship))
 
-  print ("adshfoa;khdf;fajslkfjald;sdfa HERE", x)
-
-  return x["utterance"], x["end"]
 
 @embedding_call_context(CONVERSATION)
-def agent_chat_v2(maze, init_persona, target_persona): 
-  curr_chat = []
-  print ("July 23")
+def agent_chat_v2(maze, init_persona, target_persona):
+  """Return only validated speech, with an explicit structural termination.
 
-  for i in range(8): 
-    focal_points = [f"{target_persona.scratch.name}"]
-    retrieved = new_retrieve(init_persona, focal_points, 50)
-    relationship = generate_summarize_agent_relationship(init_persona, target_persona, retrieved)
-    print ("-------- relationshopadsjfhkalsdjf", relationship)
-    last_chat = ""
-    for i in curr_chat[-4:]:
-      last_chat += ": ".join(i) + "\n"
-    if last_chat: 
-      focal_points = [f"{relationship}", 
-                      f"{target_persona.scratch.name} is {target_persona.scratch.act_description}", 
-                      last_chat]
-    else: 
-      focal_points = [f"{relationship}", 
-                      f"{target_persona.scratch.name} is {target_persona.scratch.act_description}"]
-    retrieved = new_retrieve(init_persona, focal_points, 15)
-    utt, end = generate_one_utterance(maze, init_persona, target_persona, retrieved, curr_chat)
+  Retrieval retains its existing actor-local last_accessed mutations. This
+  function installs no chat, schedule, world effect or new memory.
+  """
+  transcript = []
 
-    curr_chat += [[init_persona.scratch.name, utt]]
-    if end:
-      break
+  def failed(surface, speaker, target, status, attempts, reason):
+    return ConversationResult(tuple(transcript), ConversationTermination.FAILURE,
+      ConversationFailure(surface, speaker.scratch.name, target.scratch.name,
+                          status, attempts, reason))
 
-
-    focal_points = [f"{init_persona.scratch.name}"]
-    retrieved = new_retrieve(target_persona, focal_points, 50)
-    relationship = generate_summarize_agent_relationship(target_persona, init_persona, retrieved)
-    print ("-------- relationshopadsjfhkalsdjf", relationship)
-    last_chat = ""
-    for i in curr_chat[-4:]:
-      last_chat += ": ".join(i) + "\n"
-    if last_chat: 
-      focal_points = [f"{relationship}", 
-                      f"{init_persona.scratch.name} is {init_persona.scratch.act_description}", 
-                      last_chat]
-    else: 
-      focal_points = [f"{relationship}", 
-                      f"{init_persona.scratch.name} is {init_persona.scratch.act_description}"]
-    retrieved = new_retrieve(target_persona, focal_points, 15)
-    utt, end = generate_one_utterance(maze, target_persona, init_persona, retrieved, curr_chat)
-
-    curr_chat += [[target_persona.scratch.name, utt]]
-    if end:
-      break
-
-  print ("July 23 PU")
-  for row in curr_chat: 
-    print (row)
-  print ("July 23 FIN")
-
-  return curr_chat
+  for _ in range(MAX_CONVERSATION_ROUNDS):
+    for speaker, target in ((init_persona, target_persona),
+                            (target_persona, init_persona)):
+      surface = 'relationship_retrieval'
+      try:
+        retrieved = new_retrieve(speaker, [target.scratch.name], 50)
+        surface = 'relationship'
+        relationship = generate_summarize_agent_relationship(speaker, target, retrieved)
+        if relationship.status != ConversationStatus.SUCCESS:
+          return failed(surface, speaker, target, relationship.status,
+                        relationship.attempt_count, relationship.reason)
+        focal_points = [relationship.relationship,
+                        f'{target.scratch.name} is {target.scratch.act_description}']
+        if transcript:
+          focal_points.append(''.join(': '.join(row) + '\n' for row in transcript[-4:]))
+        surface = 'utterance_retrieval'
+        retrieved = new_retrieve(speaker, focal_points, 15)
+        surface = 'utterance'
+        result = generate_one_utterance(
+          maze, speaker, target, retrieved, transcript, relationship)
+      except (LLMProviderError, ModernChatRuntimeError) as error:
+        # Retrieval/provider infrastructure failures also fail closed. Unknown
+        # programming and cost/accounting exceptions deliberately propagate.
+        return failed(surface, speaker, target, provider_failure(error), 0,
+                      type(error).__name__)
+      if result.status != ConversationStatus.SUCCESS:
+        return failed(surface, speaker, target, result.status,
+                      result.attempt_count, result.reason)
+      transcript.append((speaker.scratch.name, result.utterance))
+      if result.end:
+        return ConversationResult(tuple(transcript), ConversationTermination.MODEL_END)
+  return ConversationResult(tuple(transcript), ConversationTermination.SAFETY_CEILING)
 
 
 

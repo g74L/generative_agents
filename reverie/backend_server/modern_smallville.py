@@ -1546,13 +1546,14 @@ class _ConversationObserver:
           init_persona, target_persona, retrieved)
 
     def actor_utterance(maze, init_persona, target_persona, retrieved,
-                        curr_chat):
+                        curr_chat, relationship):
       with self._actor_context(init_persona.name):
-        utterance, end = self._originals["utterance"](
-          maze, init_persona, target_persona, retrieved, curr_chat)
-      self.turn_results.append({"speaker": init_persona.name,
-                                "end": bool(end)})
-      return utterance, end
+        result = self._originals["utterance"](
+          maze, init_persona, target_persona, retrieved, curr_chat, relationship)
+      if result.status.value == "SUCCESS":
+        self.turn_results.append({"speaker": init_persona.name,
+                                  "end": result.end})
+      return result
 
     plan_module._should_react = observed_should_react
     plan_module._chat_react = observed_chat_react

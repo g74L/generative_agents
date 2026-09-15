@@ -1,0 +1,26 @@
+Speaker's own identity:
+{identity}
+
+Speaker: {speaker}
+Interlocutor: {target}
+Speaker-local memories: {memories}
+Speaker's relationship interpretation: {relationship}
+Locally recalled previous conversation: {previous_chat}
+
+Time: {time}
+Location: {location}
+Speaker's current activity: {speaker_activity}
+Interlocutor's observable activity: {target_activity}
+
+Already spoken transcript (speaker, utterance pairs):
+{transcript}
+
+{turn_context}
+What does {speaker} say to {target} next, and does this utterance end the conversation?
+Use the speaker's identity and available context. The transcript and relationship
+interpretation are actor perspectives, not authoritative world truth.
+
+Return only a JSON object with exactly these keys:
+{{"utterance": "non-empty text spoken by the speaker", "end": false}}
+"end" must be a JSON boolean: true to end the conversation, false to continue.
+Do not quote booleans or add Markdown, extra keys or text outside the JSON object.
