@@ -20,6 +20,11 @@ from persona.prompt_template.llm_provider import (
 )
 from persona.cognitive_modules.retrieve import *
 from persona.cognitive_modules.converse import *
+from persona.cognitive_modules.social_talk_decision import (
+  build_social_talk_request,
+  consume_social_talk_result,
+  decide_social_talk,
+)
 
 ##############################################################################
 # CHAPTER 2: Generate
@@ -304,13 +309,9 @@ def generate_convo_summary(persona, convo):
 
 
 def generate_decide_to_talk(init_persona, target_persona, retrieved): 
-  x =run_gpt_prompt_decide_to_talk(init_persona, target_persona, retrieved)[0]
-  if debug: print ("GNS FUNCTION: <generate_decide_to_talk>")
-
-  if x == "yes": 
-    return True
-  else: 
-    return False
+  request = build_social_talk_request(init_persona, target_persona, retrieved)
+  result = decide_social_talk(request)
+  return consume_social_talk_result(request, result)
 
 
 def generate_decide_to_react(init_persona, target_persona, retrieved): 

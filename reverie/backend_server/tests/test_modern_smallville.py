@@ -54,7 +54,7 @@ class NaturalConversationFakeAdapter(ModernTickFakeAdapter):
 
   def response_for_caller(self, caller_id):
     if caller_id == "decide_to_talk":
-      return "yes"
+      return '{"decision":"yes"}'
     if caller_id == "agent_chat_summarize_relationship":
       return '{"output": "context"}'
     if caller_id == "iterative_chat_utterance":

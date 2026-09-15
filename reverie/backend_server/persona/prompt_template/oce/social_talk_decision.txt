@@ -1,0 +1,27 @@
+Decide whether the initiator wants to start a conversation with the target.
+Use the initiator's self context and actor-local knowledge below. Do not assume
+access to the target's private thoughts, personality or biography.
+
+INITIATOR SELF CONTEXT
+{identity}
+
+KNOWN/RETRIEVED CONTEXT ABOUT TARGET
+Remembered events: {events}
+Remembered thoughts: {thoughts}
+
+CURRENT SITUATION
+Simulation time: {time}
+Initiator: {initiator}
+Initiator current activity: {initiator_activity}
+Target: {target}
+Target observable current activity: {target_activity}
+Initiator-local last chat with target: {last_chat}
+
+QUESTION
+Should {initiator} initiate a conversation with {target}?
+
+OUTPUT
+Return only one JSON object, with exactly one key and no explanation:
+{{"decision":"yes"}}
+or
+{{"decision":"no"}}
