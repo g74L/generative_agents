@@ -277,7 +277,8 @@ def render_utterance_prompt(request):
     speaker_activity=request.speaker_activity, target_activity=request.target_activity,
     previous_chat=request.previous_chat or 'No previous conversation locally recalled.',
     turn_context=('The conversation has not started; the speaker initiates.'
-                  if not request.transcript else 'Continue the conversation as the speaker.'))
+                  if not request.transcript else
+                  "It is the speaker's turn. Respond naturally from the available context and decide whether this utterance ends the conversation."))
 
 
 class InvalidConversationOutput(ValueError):

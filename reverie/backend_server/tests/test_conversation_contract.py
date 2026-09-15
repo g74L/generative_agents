@@ -319,8 +319,37 @@ class ConversationContractTests(unittest.TestCase):
     prompt = contract.render_utterance_prompt(request)
     for value in (request.relationship, 'Already spoken', request.target_activity, request.speaker_activity):
       self.assertIn(value, prompt)
-    self.assertIn('Continue the conversation', prompt)
+    self.assertIn(
+      "It is the speaker's turn. Respond naturally from the available context "
+      "and decide whether this utterance ends the conversation.", prompt)
+    self.assertNotIn('Continue the conversation as the speaker.', prompt)
     self.assertNotIn('speaker initiates', prompt)
+
+  def test_initial_turn_context_remains_initial_with_balanced_end_examples(self):
+    prompt = contract.render_utterance_prompt(self.request())
+    self.assertIn(
+      'The conversation has not started; the speaker initiates.', prompt)
+    self.assertNotIn("It is the speaker's turn.", prompt)
+    self.assertNotIn('Continue the conversation as the speaker.', prompt)
+    self.assertIn(
+      'The following examples demonstrate structure only:\n'
+      'Continuing: {"utterance":"non-empty text spoken by the speaker","end":false}\n'
+      'Ending: {"utterance":"non-empty text spoken by the speaker","end":true}',
+      prompt)
+
+  def test_balanced_end_examples_preserve_strict_output_instruction(self):
+    prompt = contract.render_utterance_prompt(
+      self.request(transcript=((SAM, 'Already spoken'),)))
+    self.assertEqual(1, prompt.count(
+      'Continuing: {"utterance":"non-empty text spoken by the speaker","end":false}'))
+    self.assertEqual(1, prompt.count(
+      'Ending: {"utterance":"non-empty text spoken by the speaker","end":true}'))
+    self.assertIn(
+      '"end" must be a JSON boolean: true to end the conversation, false to continue.',
+      prompt)
+    self.assertIn(
+      'Do not quote booleans or add Markdown, extra keys or text outside the JSON object.',
+      prompt)
 
   def test_invalid_context_returns_before_provider(self):
     for field, value in (('identity', ''), ('relationship', ''), ('memories', None),

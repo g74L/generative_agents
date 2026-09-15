@@ -21,6 +21,8 @@ Use the speaker's identity and available context. The transcript and relationshi
 interpretation are actor perspectives, not authoritative world truth.
 
 Return only a JSON object with exactly these keys:
-{{"utterance": "non-empty text spoken by the speaker", "end": false}}
+The following examples demonstrate structure only:
+Continuing: {{"utterance":"non-empty text spoken by the speaker","end":false}}
+Ending: {{"utterance":"non-empty text spoken by the speaker","end":true}}
 "end" must be a JSON boolean: true to end the conversation, false to continue.
 Do not quote booleans or add Markdown, extra keys or text outside the JSON object.
