@@ -34,6 +34,15 @@ from global_methods import *
 from utils import *
 from maze import *
 from persona.persona import *
+from smallville_world_transition import (
+  ObjectEffectKind,
+  ObjectEffectRejectionReason,
+  ObjectEffectStatus,
+  ObjectEffectTransitionError,
+  SmallvilleObjectEffectProposal,
+  classify_object_effect,
+  ground_object_effect,
+)
 
 ##############################################################################
 #                                  REVERIE                                   #
@@ -276,6 +285,24 @@ class ReverieServer:
       time.sleep(self.server_sleep * 10)
 
 
+  def _commit_object_effect(self, decision, game_obj_cleanup):
+    """Publish an accepted material effect in the existing Smallville order.
+
+    The decision is consumed synchronously against this server's live Maze.
+    This is not a transaction: cleanup/add/remove failures have no rollback.
+    """
+    proposal = decision.proposal
+    if decision.status != ObjectEffectStatus.ACCEPTED:
+      raise ObjectEffectTransitionError(
+        decision.reason, proposal.source_actor, proposal.target_address)
+    active_event = proposal.as_event()
+    tile = proposal.publication_tile
+    game_obj_cleanup[active_event] = tile
+    self.maze.add_event_from_tile(active_event, tile)
+    self.maze.remove_event_from_tile(
+      (proposal.target_address, None, None, None), tile)
+
+
   def start_server(self, int_counter): 
     """
     The main backend server of Reverie. 
@@ -343,6 +370,26 @@ class ReverieServer:
             new_tile = (new_env[persona_name]["x"], 
                         new_env[persona_name]["y"])
 
+            # Validate only material proposals, before mutating this actor.
+            # Earlier actors and prior-cycle cleanup may already have changed
+            # the world; the tick remains non-transactional and actor-ordered.
+            object_decision = None
+            if not persona.scratch.planned_path:
+              object_event = persona.scratch.get_curr_obj_event_and_desc()
+              object_kind = classify_object_effect(object_event)
+              if object_kind == ObjectEffectKind.MALFORMED_OBJECT_EFFECT_PROPOSAL:
+                raise ObjectEffectTransitionError(
+                  ObjectEffectRejectionReason.MALFORMED_OBJECT_EFFECT,
+                  persona.name, object_event[0])
+              if object_kind == ObjectEffectKind.MATERIAL_OBJECT_EFFECT_PROPOSAL:
+                proposal = SmallvilleObjectEffectProposal.from_event(
+                  persona.name, object_event, new_tile)
+                object_decision = ground_object_effect(
+                  proposal, self.maze.address_tiles)
+                if object_decision.status == ObjectEffectStatus.REJECTED:
+                  raise ObjectEffectTransitionError(
+                    object_decision.reason, persona.name, proposal.target_address)
+
             # We actually move the persona on the backend tile map here. 
             self.personas_tile[persona_name] = new_tile
             self.maze.remove_subject_events_from_tile(persona.name, curr_tile)
@@ -351,7 +398,11 @@ class ReverieServer:
 
             # Now, the persona will travel to get to their destination. *Once*
             # the persona gets there, we activate the object action.
-            if not persona.scratch.planned_path: 
+            if object_decision is not None:
+              self._commit_object_effect(object_decision, game_obj_cleanup)
+            elif not persona.scratch.planned_path:
+              # NO_OBJECT_EFFECT: retain legacy publication and cleanup,
+              # including empty tuples and location/social sentinel events.
               # We add that new object action event to the backend tile map. 
               # At its creation, it is stored in the persona's backend. 
               game_obj_cleanup[persona.scratch

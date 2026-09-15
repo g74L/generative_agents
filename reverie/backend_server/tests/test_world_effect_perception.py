@@ -37,6 +37,7 @@ from persona.prompt_template.llm_provider import (
   clear_telemetry,
   reset_embedding_cache,
 )
+from smallville_world_transition import ObjectEffectStatus
 
 
 REVERIE_SPEC = importlib.util.spec_from_file_location(
@@ -231,14 +232,47 @@ class GroundedWorldEffectPerceptionMemoryTests(unittest.TestCase):
         actor_b.move = actor_b_move
         server.personas[PASSIVE_ACTOR].move = passive_move
 
+        # The other two actors have no proposal; their bootstrap states must
+        # retain compatibility without entering the material grounding gate.
+        self.assertIsNone(actor_b.scratch.act_address)
+        self.assertIsNone(server.personas[PASSIVE_ACTOR].scratch.act_address)
+        decisions = []
+        original_ground = reverie_module.ground_object_effect
+
+        def observed_ground(proposal, address_tiles):
+          self.assertNotIn(active_event, toaster_details["events"])
+          self.assertIn(idle_event, toaster_details["events"])
+          decision = original_ground(proposal, address_tiles)
+          decisions.append(decision)
+          return decision
+
         # T2: only ReverieServer.start_server drives the production Maze
         # mutation. The observed methods delegate unchanged to the real Maze.
         with patch.object(
             server.maze, "add_event_from_tile", side_effect=observed_add), \
             patch.object(
               server.maze, "remove_event_from_tile",
-              side_effect=observed_remove):
+              side_effect=observed_remove), \
+            patch.object(reverie_module, "classify_object_effect",
+                         wraps=reverie_module.classify_object_effect) as classify, \
+            patch.object(reverie_module, "ground_object_effect",
+                         side_effect=observed_ground) as ground, \
+            patch.object(server, "_commit_object_effect",
+                         wraps=server._commit_object_effect) as commit:
           server.start_server(1)
+
+        self.assertEqual(3, classify.call_count)
+        self.assertEqual(
+          [active_event, ("", None, None, None), ("", None, None, None)],
+          [call.args[0] for call in classify.call_args_list])
+        self.assertEqual(1, ground.call_count)
+        self.assertEqual(1, commit.call_count)
+        self.assertIs(commit.call_args.args[0], decisions[0])
+        self.assertEqual(ObjectEffectStatus.ACCEPTED, decisions[0].status)
+        self.assertEqual(ACTOR_A, decisions[0].proposal.source_actor)
+        self.assertEqual(EXPECTED_TOASTER_TILE,
+                         decisions[0].proposal.publication_tile)
+        self.assertEqual(active_event, decisions[0].proposal.as_event())
 
         # T3/T4: the active tuple existed before Actor B invoked the normal
         # Persona.perceive entry point and remains authoritative afterward.
