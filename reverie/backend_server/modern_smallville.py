@@ -27,6 +27,7 @@ if str(BACKEND_ROOT) not in sys.path:
   sys.path.insert(0, str(BACKEND_ROOT))
 
 import controlled_replay
+from smallville_compatibility import copy_environment_actor_with_movement
 from persona.prompt_template import run_gpt_prompt
 from persona.prompt_template.chat_runtime import use_modern_chat_runtime
 from persona.prompt_template.completion_runtime import (
@@ -2345,8 +2346,8 @@ def _execute_modern_smallville(
                   or "chat" not in actor_frame):
                 raise ModernRuntimeInvariantError(
                   "movement frame contains invalid actor metadata")
-              environment[name] = dict(environment[name])
-              environment[name]["x"], environment[name]["y"] = coordinate
+              environment[name] = copy_environment_actor_with_movement(
+                environment[name], coordinate)
               if name in config.cognitive_actors:
                 tick_actors[name] = _actor_tick_metadata(
                   server.personas[name], coordinate)
