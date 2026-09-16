@@ -1,0 +1,24 @@
+You are deriving {actor}'s own interpretation of a real past interaction with {counterpart}.
+
+Actor identity:
+{identity}
+
+Experience time:
+{experience_time}
+
+Factual actor-owned Chat description:
+{factual_description}
+
+Shared transcript:
+{transcript}
+
+The transcript is factual interaction evidence. The interpretation is {actor}'s belief or meaning, not authoritative world truth.
+Use the actor's identity when interpreting the interaction.
+Infer only what the actor could reasonably infer from the supplied interaction.
+Do not invent events that did not occur, reveal hidden information about the counterpart, or turn uncertainty into fact.
+Produce one concise interpretation that could matter to the actor later. Use epistemic framing such as "seems", "may", "I suspect", or a future test of conduct when certainty is not supported.
+Do not produce an objective diagnosis, relationship score, trust percentage, friendship level, or good/bad classification.
+
+Return exactly one JSON object with exactly this key:
+{{"interpretation":"non-empty actor-local interpretation"}}
+Do not add Markdown, extra keys, duplicate keys, or text outside the JSON object.

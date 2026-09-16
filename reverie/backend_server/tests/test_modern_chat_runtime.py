@@ -1044,7 +1044,8 @@ class ModernChatRuntimeTests(unittest.TestCase):
     self.assertEqual(
       ("pronunciatio", "act_obj_desc", "event_poignancy", "focal_pt",
        "agent_chat_summarize_relationship", "iterative_chat_utterance",
-       "summarize_conversation", "chat_poignancy", "memo_on_convo"),
+       "summarize_conversation", "chat_poignancy", "memo_on_convo",
+       "social_interpretation"),
       M5_REPLAY_CALLER_ALLOWLIST)
 
   def test_115_pronunciatio_micro_run_is_one_call_without_legacy_detection(self):
@@ -1195,7 +1196,8 @@ class ModernChatRuntimeTests(unittest.TestCase):
     self.assertEqual(
       ("pronunciatio", "act_obj_desc", "event_poignancy", "focal_pt",
        "agent_chat_summarize_relationship", "iterative_chat_utterance",
-       "summarize_conversation", "chat_poignancy", "memo_on_convo"),
+       "summarize_conversation", "chat_poignancy", "memo_on_convo",
+       "social_interpretation"),
       M5_REPLAY_CALLER_ALLOWLIST)
 
   def test_125_event_poignancy_preserves_prompt_and_privacy(self):
